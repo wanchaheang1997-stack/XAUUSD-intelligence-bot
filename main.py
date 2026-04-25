@@ -2,7 +2,6 @@ import os
 import logging
 import datetime
 import requests
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from telegram import Update
@@ -21,18 +20,58 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN  = os.getenv("BOT_TOKEN")
-MY_CHAT_ID = os.getenv("MY_CHAT_ID")
-TOPIC_ID   = os.getenv("TOPIC_ID")
+BOT_TOKEN          = os.getenv("BOT_TOKEN")
+MY_CHAT_ID         = os.getenv("MY_CHAT_ID")
+TOPIC_ID           = os.getenv("TOPIC_ID")
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
+
+# ── Twelve Data Fetcher ────────────────────────────────────────────────────────
 
 def get_xauusd_data():
-    ticker = yf.Ticker("GC=F")
-    df = ticker.history(period="10d", interval="1h")
-    if df.empty:
-        raise ValueError("No market data returned from yfinance")
+    """Fetch XAUUSD candles from Twelve Data — works weekends too."""
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol"    : "XAU/USD",
+        "interval"  : "1h",
+        "outputsize": 100,
+        "apikey"    : TWELVEDATA_API_KEY,
+    }
+    r = requests.get(url, params=params, timeout=10)
+    data = r.json()
+
+    if "values" not in data:
+        raise ValueError(f"Twelve Data error: {data.get('message', 'Unknown error')}")
+
+    df = pd.DataFrame(data["values"])
+    df = df.rename(columns={
+        "datetime": "Date",
+        "open"    : "Open",
+        "high"    : "High",
+        "low"     : "Low",
+        "close"   : "Close",
+    })
+    df["Date"]  = pd.to_datetime(df["Date"])
+    df["Open"]  = df["Open"].astype(float)
+    df["High"]  = df["High"].astype(float)
+    df["Low"]   = df["Low"].astype(float)
+    df["Close"] = df["Close"].astype(float)
+    df = df.sort_values("Date").reset_index(drop=True)
     return df
 
+
+def get_live_price():
+    """Get real-time XAUUSD price from Twelve Data."""
+    url = "https://api.twelvedata.com/price"
+    params = {"symbol": "XAU/USD", "apikey": TWELVEDATA_API_KEY}
+    r = requests.get(url, params=params, timeout=10)
+    data = r.json()
+    if "price" in data:
+        return round(float(data["price"]), 2)
+    return None
+
+
+# ── Indicators ─────────────────────────────────────────────────────────────────
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -51,19 +90,38 @@ def calculate_macd(series):
     return macd, signal, histogram
 
 
+# ── Support & Resistance ───────────────────────────────────────────────────────
+
 def get_support_resistance(df):
     resistance = round(df["High"].rolling(10).max().iloc[-1], 2)
     support    = round(df["Low"].rolling(10).min().iloc[-1], 2)
     return support, resistance
 
 
+# ── ICT Levels ─────────────────────────────────────────────────────────────────
+
 def get_ict_levels(df):
-    daily = yf.Ticker("GC=F").history(period="10d", interval="1d")
-    pdh = round(daily["High"].iloc[-2], 2)
-    pdl = round(daily["Low"].iloc[-2], 2)
-    pdc = round(daily["Close"].iloc[-2], 2)
+    # Get daily data for PDH/PDL
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol"    : "XAU/USD",
+        "interval"  : "1day",
+        "outputsize": 5,
+        "apikey"    : TWELVEDATA_API_KEY,
+    }
+    r    = requests.get(url, params=params, timeout=10)
+    data = r.json()
+
+    pdh, pdl, pdc = None, None, None
+    if "values" in data and len(data["values"]) >= 2:
+        prev    = data["values"][1]  # previous day
+        pdh     = round(float(prev["high"]), 2)
+        pdl     = round(float(prev["low"]), 2)
+        pdc     = round(float(prev["close"]), 2)
+
     eq_high = round(df["High"].tail(20).max(), 2)
     eq_low  = round(df["Low"].tail(20).min(), 2)
+
     fvg_bull, fvg_bear = None, None
     for i in range(2, len(df)):
         c0_high = df["High"].iloc[i - 2]
@@ -74,24 +132,26 @@ def get_ict_levels(df):
             fvg_bull = (round(c0_high, 2), round(c2_low, 2))
         if c2_high < c0_low:
             fvg_bear = (round(c2_high, 2), round(c0_low, 2))
+
     return pdh, pdl, pdc, eq_high, eq_low, fvg_bull, fvg_bear
 
 
-def get_liquidity(df, price):
-    daily       = yf.Ticker("GC=F").history(period="10d", interval="1d")
-    pdh         = round(daily["High"].iloc[-2], 2)
-    pdl         = round(daily["Low"].iloc[-2], 2)
-    spread      = round(pdh - pdl, 2)
-    equilibrium = round((pdh + pdl) / 2, 2)
-    ext_buy     = f"${pdh + 2:.2f}+"
-    ext_sell    = f"Below ${pdl - 2:.2f}"
+# ── Liquidity ──────────────────────────────────────────────────────────────────
+
+def get_liquidity(df, price, pdh, pdl):
+    spread      = round(pdh - pdl, 2) if pdh and pdl else "N/A"
+    equilibrium = round((pdh + pdl) / 2, 2) if pdh and pdl else None
+    ext_buy     = f"${pdh + 2:.2f}+" if pdh else "N/A"
+    ext_sell    = f"Below ${pdl - 2:.2f}" if pdl else "N/A"
     int_status  = (
         "Price above EQ — Seeking Buy-Side"
-        if price > equilibrium
+        if equilibrium and price > equilibrium
         else "Price below EQ — Seeking Sell-Side"
     )
     return ext_buy, ext_sell, equilibrium, int_status, spread
 
+
+# ── Trend ──────────────────────────────────────────────────────────────────────
 
 def get_trend(df):
     ema20 = df["Close"].ewm(span=20).mean().iloc[-1]
@@ -105,6 +165,8 @@ def get_trend(df):
         return "⚖️ RANGING", "Mixed EMA signals"
 
 
+# ── Signal ─────────────────────────────────────────────────────────────────────
+
 def get_signal(rsi, macd_val, signal_val, trend):
     if "BULLISH" in trend and rsi < 70 and macd_val > signal_val:
         return "🟢 BUY", "Bullish trend + RSI healthy + MACD crossover"
@@ -117,6 +179,8 @@ def get_signal(rsi, macd_val, signal_val, trend):
     else:
         return "⏳ WAIT", "No clear signal — stay patient"
 
+
+# ── News ───────────────────────────────────────────────────────────────────────
 
 def get_economic_news():
     try:
@@ -135,14 +199,19 @@ def get_economic_news():
     return ["News unavailable"]
 
 
+# ── Report Builder ─────────────────────────────────────────────────────────────
+
 async def build_report(bot, chat_id, topic_id=None):
     try:
-        df    = get_xauusd_data()
-        price = round(df["Close"].iloc[-1], 2)
-        high  = round(df["High"].iloc[-1], 2)
-        low   = round(df["Low"].iloc[-1], 2)
+        df = get_xauusd_data()
 
-        last_candle_time = df.index[-1].strftime("%Y-%m-%d %H:%M UTC")
+        # Try live price first, fall back to last candle
+        live_price = get_live_price()
+        price      = live_price if live_price else round(df["Close"].iloc[-1], 2)
+        high       = round(df["High"].iloc[-1], 2)
+        low        = round(df["Low"].iloc[-1], 2)
+
+        last_candle_time = df["Date"].iloc[-1].strftime("%Y-%m-%d %H:%M UTC")
 
         rsi_series         = calculate_rsi(df["Close"])
         rsi                = round(rsi_series.iloc[-1], 2)
@@ -153,9 +222,9 @@ async def build_report(bot, chat_id, topic_id=None):
 
         support, resistance                                  = get_support_resistance(df)
         trend_label, trend_reason                            = get_trend(df)
-        signal_label, sig_reason                             = get_signal(rsi, macd_val, signal_val, trend_label)
         pdh, pdl, pdc, eq_high, eq_low, fvg_bull, fvg_bear  = get_ict_levels(df)
-        ext_buy, ext_sell, equilibrium, int_status, spread   = get_liquidity(df, price)
+        signal_label, sig_reason                             = get_signal(rsi, macd_val, signal_val, trend_label)
+        ext_buy, ext_sell, equilibrium, int_status, spread   = get_liquidity(df, price, pdh, pdl)
 
         news       = get_economic_news()
         news_lines = "\n".join([f"  • {n}" for n in news])
@@ -163,18 +232,18 @@ async def build_report(bot, chat_id, topic_id=None):
         fvg_bull_str = f"${fvg_bull[0]} – ${fvg_bull[1]}" if fvg_bull else "None detected"
         fvg_bear_str = f"${fvg_bear[0]} – ${fvg_bear[1]}" if fvg_bear else "None detected"
         rsi_label    = "🔥 Overbought" if rsi > 70 else "🧊 Oversold" if rsi < 30 else "✅ Neutral"
+        eq_str       = f"${equilibrium}" if equilibrium else "N/A"
 
-        # Weekend banner
-        today = datetime.datetime.utcnow().weekday()
-        weekend_note = "\n⚠️ _Weekend — showing last Friday close_\n" if today >= 5 else ""
+        today        = datetime.datetime.utcnow().weekday()
+        weekend_note = "\n⚠️ _Weekend — showing last available data_\n" if today >= 5 else ""
 
         report = f"""
 🏦 *E11 INTELLIGENCE — XAUUSD*
 🕐 {last_candle_time}{weekend_note}
 💰 *PRICE*
   Current : *${price}*
-  High    : ${high}
-  Low     : ${low}
+  H1 High : ${high}
+  H1 Low  : ${low}
 
 📊 *TREND*
   {trend_label}
@@ -196,7 +265,7 @@ async def build_report(bot, chat_id, topic_id=None):
 💧 *LIQUIDITY*
   🔵 Buy-Side  : {ext_buy}
   🔴 Sell-Side : {ext_sell}
-  ⚖️ EQ Level  : ${equilibrium}
+  ⚖️ EQ Level  : {eq_str}
   📍 Internal  : {int_status}
   📏 Day Range : ${spread}
 
@@ -230,13 +299,14 @@ _E11 Sniper Bot • Educational use only_
 
     except Exception as e:
         logger.error(f"❌ Report error: {e}", exc_info=True)
-        # Always send the actual error so we can debug
         await bot.send_message(
             chat_id=chat_id,
             text=f"❌ Report failed:\n\n`{str(e)}`",
             parse_mode="Markdown",
         )
 
+
+# ── Handlers ───────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -261,13 +331,12 @@ async def instant_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = datetime.datetime.utcnow().weekday()
     if today >= 5:
         await update.message.reply_text(
-            "📅 *Weekend Mode — Last Friday Data*\n"
-            "_(Markets closed — fetching last available data...)_",
+            "📅 *Weekend Mode — Last Available Data*\n"
+            "_(Markets closed — fetching last candle...)_",
             parse_mode="Markdown",
         )
     else:
         await update.message.reply_text("⏳ Analyzing XAUUSD market...")
-    # Always try to build report regardless of weekend
     await build_report(context.bot, update.effective_chat.id, TOPIC_ID)
 
 
@@ -275,11 +344,15 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❓ Unknown command. Try /help.")
 
 
+# ── Main ───────────────────────────────────────────────────────────────────────
+
 def main():
     if not BOT_TOKEN:
         raise EnvironmentError("BOT_TOKEN is not set!")
     if not MY_CHAT_ID:
         raise EnvironmentError("MY_CHAT_ID is not set!")
+    if not TWELVEDATA_API_KEY:
+        raise EnvironmentError("TWELVEDATA_API_KEY is not set!")
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
