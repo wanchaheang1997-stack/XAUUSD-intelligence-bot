@@ -37,11 +37,29 @@ async def send_auto_report(bot):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Bot is running!")
+    await update.message.reply_text(
+        "👋 Bot is running!\nUse /help to see commands."
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 *Available Commands:*\n"
+        "/start — Start the bot\n"
+        "/help — Show this message\n"
+        "/report — Get an instant report",
+        parse_mode="Markdown",
+    )
+
+
+async def instant_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Sending report...")
+    await send_auto_report(context.bot)
+    await update.message.reply_text("✅ Done!")
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❓ Unknown command.")
+    await update.message.reply_text("❓ Unknown command. Try /help.")
 
 
 def main():
@@ -52,9 +70,13 @@ def main():
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
+    # ── Handlers (order matters — catch-all MUST be last) ─────────────────────
+    application.add_handler(CommandHandler("start",  start))
+    application.add_handler(CommandHandler("help",   help_command))
+    application.add_handler(CommandHandler("report", instant_report))
     application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
+    # ── Scheduler ─────────────────────────────────────────────────────────────
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(
         send_auto_report,
