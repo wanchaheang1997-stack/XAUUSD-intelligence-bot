@@ -1,54 +1,130 @@
-import asyncio
+import os
 import logging
-import os  # បន្ថែម os សម្រាប់ទាញយក Variables ពី Railway
-from telegram.ext import ApplicationBuilder, CommandHandler
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-logging.basicConfig(level=logging.INFO)
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
-# --- ចំណុចមេត្រូវផ្ទៀងផ្ទាត់ ---
-# ទាញយក Token និង ID ពី Variables ដែលមេបានដាក់ក្នុង Railway
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("MY_CHAT_ID") 
+# ── Environment Variables ──────────────────────────────────────────────────────
+BOT_TOKEN  = os.getenv("BOT_TOKEN")
+MY_CHAT_ID = os.getenv("MY_CHAT_ID")
+TOPIC_ID   = os.getenv("TOPIC_ID")   # Optional — only set if using a forum topic
 
-async def send_auto_report(bot):
-    if CHAT_ID:
-        try:
-            await bot.send_message(chat_id=CHAT_ID, text="📊 **E11 Sniper Daily Report**: ទីផ្សារមាសថ្ងៃនេះ...")
-        except Exception as e:
-            logger.error(f"Error sending report: {e}")
+# ── Scheduled Job ─────────────────────────────────────────────────────────────
+async def send_daily_report(bot):
+    """
+    Sends the daily report.
+    - If TOPIC_ID is set, sends to that specific forum thread.
+    - Wrapped in try/except so a failure never crashes the bot.
+    """
+    try:
+        kwargs = {
+            "chat_id"    : MY_CHAT_ID,
+            "text"       : "📊 *Daily Report*\n\nYour scheduled report is ready!",
+            "parse_mode" : "Markdown",
+        }
+        # Only add message_thread_id if TOPIC_ID is actually configured
+        if TOPIC_ID:
+            kwargs["message_thread_id"] = int(TOPIC_ID)
 
-async def start(update, context):
-    await update.message.reply_text("ជម្រាបសួរមេ! E11 Sniper Bot រួចរាល់ហើយ។")
+        await bot.send_message(**kwargs)
+        logger.info("✅ Daily report sent successfully.")
 
+    except Exception as e:
+        # Log the error but DO NOT re-raise — keeps the bot alive
+        logger.error(f"❌ Failed to send daily report: {e}", exc_info=True)
+
+
+# ── Command Handlers ───────────────────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Hello! I'm running and stable.\n"
+        "Use /help to see available commands."
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 *Available Commands:*\n"
+        "/start  — Start the bot\n"
+        "/help   — Show this message\n"
+        "/report — Trigger an instant report",
+        parse_mode="Markdown",
+    )
+
+async def instant_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lets you manually trigger the daily report on demand."""
+    await update.message.reply_text("⏳ Sending report...")
+    await send_daily_report(context.bot)
+    await update.message.reply_text("✅ Done!")
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❓ Unknown command. Try /help.")
+
+
+# ── Startup Validation ─────────────────────────────────────────────────────────
+def validate_env():
+    """Fail fast on startup if critical variables are missing."""
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not MY_CHAT_ID:
+        missing.append("MY_CHAT_ID")
+    if missing:
+        raise EnvironmentError(
+            f"❌ Missing required environment variables: {', '.join(missing)}\n"
+            "Set them in Railway → your service → Variables tab."
+        )
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 def main():
-    if not TOKEN:
-        logger.error("❌ រកមិនឃើញ TELEGRAM_TOKEN ក្នុង Variables ទេ។ សូមឆែកក្នុង Railway!")
-        return
+    validate_env()
 
     # Build the application
-    application = ApplicationBuilder().token(TOKEN).build()
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Register handlers
-    application.add_handler(CommandHandler("start", start))
+    # ── Register handlers ──────────────────────────────────────────────────────
+    application.add_handler(CommandHandler("start",   start))
+    application.add_handler(CommandHandler("help",    help_command))
+    application.add_handler(CommandHandler("report",  instant_report))
+    # Catch-all for unknown commands — must be registered LAST
+    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
-    # Set up APScheduler
-    scheduler = AsyncIOScheduler()
-    # កំណត់ម៉ោងបាញ់ Report (hour=9, minute=0 គឺម៉ោង ៩ ព្រឹក)
+    # ── Scheduler ─────────────────────────────────────────────────────────────
+    scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(
-        send_auto_report,
+        send_daily_report,
         trigger="cron",
-        hour=9,
+        hour=9,        # 09:00 UTC daily — adjust to your timezone
         minute=0,
-        args=[application.bot]
+        args=[application.bot],
+        id="daily_report",
+        replace_existing=True,      # Prevents duplicate jobs on hot-reload
+        misfire_grace_time=3600,    # Run job even if Railway was briefly down
     )
     scheduler.start()
-    
+    logger.info("📅 Scheduler started — daily report at 09:00 UTC.")
     logger.info("🚀 Bot is running... Waiting for commands.")
 
-    # ✅ វិធីសាស្ត្រត្រឹមត្រូវសម្រាប់ v20+
-    application.run_polling()
+    # ✅ v20+ correct entry point
+    # run_polling() manages its own event loop — never wrap with asyncio.run()
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,   # Ignore messages sent while bot was offline
+    )
+
 
 if __name__ == "__main__":
-    main() 
+    main()
