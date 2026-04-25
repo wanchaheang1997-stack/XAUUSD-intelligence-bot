@@ -26,66 +26,60 @@ MY_CHAT_ID = os.getenv("MY_CHAT_ID")
 TOPIC_ID   = os.getenv("TOPIC_ID")
 
 
-# ── Market Analysis Engine ─────────────────────────────────────────────────────
+# ── Market Data ────────────────────────────────────────────────────────────────
 
 def get_xauusd_data():
-    """Fetch XAUUSD OHLCV data using yfinance."""
-    ticker = yf.Ticker("GC=F")  # Gold Futures = XAUUSD proxy
-    df = ticker.history(period="5d", interval="1h")
+    ticker = yf.Ticker("GC=F")
+    df = ticker.history(period="10d", interval="1h")
+    if df.empty:
+        raise ValueError("No market data available from yfinance")
     return df
 
 
+# ── Indicators ─────────────────────────────────────────────────────────────────
+
 def calculate_rsi(series, period=14):
     delta = series.diff()
-    gain = delta.clip(lower=0).rolling(period).mean()
-    loss = -delta.clip(upper=0).rolling(period).mean()
-    rs = gain / loss
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = -delta.clip(upper=0).rolling(period).mean()
+    rs    = gain / loss
     return 100 - (100 / (1 + rs))
 
 
 def calculate_macd(series):
-    ema12 = series.ewm(span=12, adjust=False).mean()
-    ema26 = series.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
+    ema12     = series.ewm(span=12, adjust=False).mean()
+    ema26     = series.ewm(span=26, adjust=False).mean()
+    macd      = ema12 - ema26
+    signal    = macd.ewm(span=9, adjust=False).mean()
     histogram = macd - signal
     return macd, signal, histogram
 
 
+# ── Support & Resistance ───────────────────────────────────────────────────────
+
 def get_support_resistance(df):
-    """Calculate key S/R levels from recent highs/lows."""
-    highs = df["High"].rolling(10).max()
-    lows  = df["Low"].rolling(10).min()
-    resistance = round(highs.iloc[-1], 2)
-    support    = round(lows.iloc[-1], 2)
+    resistance = round(df["High"].rolling(10).max().iloc[-1], 2)
+    support    = round(df["Low"].rolling(10).min().iloc[-1], 2)
     return support, resistance
 
 
+# ── ICT Levels ─────────────────────────────────────────────────────────────────
+
 def get_ict_levels(df):
-    """
-    ICT Concepts:
-    - PDH/PDL: Previous Day High/Low
-    - Equal Highs/Lows: Liquidity pools
-    - Fair Value Gap (FVG)
-    """
-    daily = yf.Ticker("GC=F").history(period="5d", interval="1d")
+    daily = yf.Ticker("GC=F").history(period="10d", interval="1d")
 
     pdh = round(daily["High"].iloc[-2], 2)
     pdl = round(daily["Low"].iloc[-2], 2)
     pdc = round(daily["Close"].iloc[-2], 2)
 
-    # Equal Highs / Equal Lows (within 0.5% tolerance)
-    recent_highs = df["High"].tail(20)
-    recent_lows  = df["Low"].tail(20)
-    eq_high = round(recent_highs.max(), 2)
-    eq_low  = round(recent_lows.min(), 2)
+    eq_high = round(df["High"].tail(20).max(), 2)
+    eq_low  = round(df["Low"].tail(20).min(), 2)
 
-    # Fair Value Gap (FVG): gap between candle[i-2] high and candle[i] low
     fvg_bull, fvg_bear = None, None
     for i in range(2, len(df)):
-        c0_high = df["High"].iloc[i-2]
+        c0_high = df["High"].iloc[i - 2]
         c2_low  = df["Low"].iloc[i]
-        c0_low  = df["Low"].iloc[i-2]
+        c0_low  = df["Low"].iloc[i - 2]
         c2_high = df["High"].iloc[i]
         if c2_low > c0_high:
             fvg_bull = (round(c0_high, 2), round(c2_low, 2))
@@ -95,31 +89,30 @@ def get_ict_levels(df):
     return pdh, pdl, pdc, eq_high, eq_low, fvg_bull, fvg_bear
 
 
+# ── Liquidity ──────────────────────────────────────────────────────────────────
+
 def get_liquidity(df, price):
-    """
-    External Liquidity: Above PDH / Below PDL (stop hunts)
-    Internal Liquidity: FVGs, order blocks inside range
-    """
-    daily  = yf.Ticker("GC=F").history(period="5d", interval="1d")
-    pdh    = round(daily["High"].iloc[-2], 2)
-    pdl    = round(daily["Low"].iloc[-2], 2)
-    spread = round(pdh - pdl, 2)
-
-    ext_buy  = f"${pdh + 2:.2f}+"   # External buy-side liquidity above PDH
-    ext_sell = f"Below ${pdl - 2:.2f}"  # External sell-side liquidity below PDL
-
-    # Internal: midpoint of previous day range
+    daily       = yf.Ticker("GC=F").history(period="10d", interval="1d")
+    pdh         = round(daily["High"].iloc[-2], 2)
+    pdl         = round(daily["Low"].iloc[-2], 2)
+    spread      = round(pdh - pdl, 2)
     equilibrium = round((pdh + pdl) / 2, 2)
-    int_status = "Price above EQ — Seeking Buy-Side" if price > equilibrium else "Price below EQ — Seeking Sell-Side"
-
+    ext_buy     = f"${pdh + 2:.2f}+"
+    ext_sell    = f"Below ${pdl - 2:.2f}"
+    int_status  = (
+        "Price above EQ — Seeking Buy-Side"
+        if price > equilibrium
+        else "Price below EQ — Seeking Sell-Side"
+    )
     return ext_buy, ext_sell, equilibrium, int_status, spread
 
+
+# ── Trend ──────────────────────────────────────────────────────────────────────
 
 def get_trend(df):
     ema20 = df["Close"].ewm(span=20).mean().iloc[-1]
     ema50 = df["Close"].ewm(span=50).mean().iloc[-1]
     price = df["Close"].iloc[-1]
-
     if price > ema20 > ema50:
         return "📈 BULLISH", "Price above EMA20 & EMA50"
     elif price < ema20 < ema50:
@@ -127,6 +120,8 @@ def get_trend(df):
     else:
         return "⚖️ RANGING", "Mixed EMA signals"
 
+
+# ── Signal ─────────────────────────────────────────────────────────────────────
 
 def get_signal(rsi, macd_val, signal_val, trend):
     if "BULLISH" in trend and rsi < 70 and macd_val > signal_val:
@@ -141,64 +136,64 @@ def get_signal(rsi, macd_val, signal_val, trend):
         return "⏳ WAIT", "No clear signal — stay patient"
 
 
+# ── News ───────────────────────────────────────────────────────────────────────
+
 def get_economic_news():
-    """Fetch latest gold-related news from GNews free API."""
     try:
-        url = "https://gnews.io/api/v4/search"
-        params = {
-            "q"      : "gold XAUUSD federal reserve",
-            "lang"   : "en",
-            "max"    : 3,
-            "token"  : os.getenv("GNEWS_API_KEY", ""),
-        }
-        r = requests.get(url, params=params, timeout=5)
+        key = os.getenv("GNEWS_API_KEY", "")
+        if not key:
+            return ["Add GNEWS_API_KEY to Railway Variables for live news"]
+        r = requests.get(
+            "https://gnews.io/api/v4/search",
+            params={"q": "gold XAUUSD federal reserve", "lang": "en", "max": 3, "token": key},
+            timeout=5,
+        )
         if r.status_code == 200:
-            articles = r.json().get("articles", [])
-            return [a["title"] for a in articles[:3]]
+            return [a["title"] for a in r.json().get("articles", [])[:3]]
     except Exception:
         pass
-    return ["News unavailable — add GNEWS_API_KEY to Railway Variables"]
+    return ["News unavailable"]
 
 
 # ── Report Builder ─────────────────────────────────────────────────────────────
 
 async def build_report(bot, chat_id, topic_id=None):
     try:
-        df = get_xauusd_data()
-        if df.empty:
-            raise ValueError("No data returned from yfinance")
+        df    = get_xauusd_data()
+        price = round(df["Close"].iloc[-1], 2)
+        high  = round(df["High"].iloc[-1], 2)
+        low   = round(df["Low"].iloc[-1], 2)
 
-        price      = round(df["Close"].iloc[-1], 2)
-        high       = round(df["High"].iloc[-1], 2)
-        low        = round(df["Low"].iloc[-1], 2)
-        now        = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        # Use last candle timestamp (shows Friday time on weekends)
+        last_candle_time = df.index[-1].strftime("%Y-%m-%d %H:%M UTC")
 
-        rsi_series          = calculate_rsi(df["Close"])
-        rsi                 = round(rsi_series.iloc[-1], 2)
-        macd, signal, hist  = calculate_macd(df["Close"])
-        macd_val            = round(macd.iloc[-1], 2)
-        signal_val          = round(signal.iloc[-1], 2)
-        hist_val            = round(hist.iloc[-1], 2)
+        rsi_series         = calculate_rsi(df["Close"])
+        rsi                = round(rsi_series.iloc[-1], 2)
+        macd, signal, hist = calculate_macd(df["Close"])
+        macd_val           = round(macd.iloc[-1], 2)
+        signal_val         = round(signal.iloc[-1], 2)
+        hist_val           = round(hist.iloc[-1], 2)
 
-        support, resistance       = get_support_resistance(df)
-        trend_label, trend_reason = get_trend(df)
-        signal_label, sig_reason  = get_signal(rsi, macd_val, signal_val, trend_label)
-
+        support, resistance             = get_support_resistance(df)
+        trend_label, trend_reason       = get_trend(df)
+        signal_label, sig_reason        = get_signal(rsi, macd_val, signal_val, trend_label)
         pdh, pdl, pdc, eq_high, eq_low, fvg_bull, fvg_bear = get_ict_levels(df)
         ext_buy, ext_sell, equilibrium, int_status, spread  = get_liquidity(df, price)
 
-        news = get_economic_news()
+        news       = get_economic_news()
         news_lines = "\n".join([f"  • {n}" for n in news])
 
         fvg_bull_str = f"${fvg_bull[0]} – ${fvg_bull[1]}" if fvg_bull else "None detected"
         fvg_bear_str = f"${fvg_bear[0]} – ${fvg_bear[1]}" if fvg_bear else "None detected"
 
+        rsi_label = "🔥 Overbought" if rsi > 70 else "🧊 Oversold" if rsi < 30 else "✅ Neutral"
+
         report = f"""
-🏦 *E11 INTELLIGENCE — XAUUSD REPORT*
-🕐 {now}
+🏦 *E11 INTELLIGENCE — XAUUSD*
+🕐 Data as of: {last_candle_time}
 
 💰 *LIVE PRICE*
-  Price : ${price}
+  Price : *${price}*
   High  : ${high}
   Low   : ${low}
 
@@ -207,27 +202,27 @@ async def build_report(bot, chat_id, topic_id=None):
   _{trend_reason}_
 
 📐 *SUPPORT & RESISTANCE*
-  Support    : ${support}
-  Resistance : ${resistance}
+  🟢 Support    : ${support}
+  🔴 Resistance : ${resistance}
 
 🧠 *ICT KEY LEVELS*
-  PDH (Prev Day High) : ${pdh}
-  PDL (Prev Day Low)  : ${pdl}
-  PDC (Prev Day Close): ${pdc}
-  Equal Highs         : ${eq_high}
-  Equal Lows          : ${eq_low}
-  Bull FVG            : {fvg_bull_str}
-  Bear FVG            : {fvg_bear_str}
+  PDH : ${pdh}
+  PDL : ${pdl}
+  PDC : ${pdc}
+  Equal Highs : ${eq_high}
+  Equal Lows  : ${eq_low}
+  Bull FVG : {fvg_bull_str}
+  Bear FVG : {fvg_bear_str}
 
 💧 *LIQUIDITY*
   🔵 External Buy-Side  : {ext_buy}
   🔴 External Sell-Side : {ext_sell}
   ⚖️ Equilibrium        : ${equilibrium}
-  📍 Internal Status    : {int_status}
-  📏 Day Range Spread   : ${spread}
+  📍 Internal           : {int_status}
+  📏 Day Range          : ${spread}
 
 📈 *INDICATORS*
-  RSI (14)  : {rsi} {'🔥 Overbought' if rsi > 70 else '🧊 Oversold' if rsi < 30 else '✅ Neutral'}
+  RSI (14)  : {rsi} {rsi_label}
   MACD      : {macd_val}
   Signal    : {signal_val}
   Histogram : {hist_val} {'▲' if hist_val > 0 else '▼'}
@@ -240,26 +235,22 @@ async def build_report(bot, chat_id, topic_id=None):
 {news_lines}
 
 ━━━━━━━━━━━━━━━━━━━
-_E11 Sniper Bot • For educational use only_
+_E11 Sniper Bot • Educational use only_
 """
 
-        kwargs = {
-            "chat_id"   : chat_id,
-            "text"      : report.strip(),
-            "parse_mode": "Markdown",
-        }
+        kwargs = {"chat_id": chat_id, "text": report.strip(), "parse_mode": "Markdown"}
         if topic_id:
             kwargs["message_thread_id"] = int(topic_id)
 
         await bot.send_message(**kwargs)
-        logger.info("✅ XAUUSD report sent.")
+        logger.info("✅ Report sent.")
 
     except Exception as e:
         logger.error(f"❌ Report error: {e}", exc_info=True)
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"❌ Report failed: {e}"
-        )
+        try:
+            await bot.send_message(chat_id=chat_id, text=f"❌ Report error: {e}")
+        except Exception:
+            pass
 
 
 # ── Handlers ───────────────────────────────────────────────────────────────────
@@ -268,23 +259,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *E11 Sniper Bot is live!*\n\n"
         "/report — Full XAUUSD market report\n"
-        "/help   — Show commands",
-        parse_mode="Markdown"
+        "/help   — Show all commands",
+        parse_mode="Markdown",
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Commands:*\n"
-        "/start  — Welcome message\n"
+        "/start  — Welcome\n"
         "/help   — This menu\n"
-        "/report — Live XAUUSD report",
-        parse_mode="Markdown"
+        "/report — Live XAUUSD intelligence report",
+        parse_mode="Markdown",
     )
 
 
 async def instant_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Analyzing XAUUSD market...")
+    today = datetime.datetime.utcnow().weekday()
+    if today >= 5:
+        await update.message.reply_text(
+            "📅 *Weekend Mode*\n"
+            "_(Markets closed — showing last available Friday data)_",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text("⏳ Analyzing XAUUSD market...")
     await build_report(context.bot, update.effective_chat.id, TOPIC_ID)
 
 
