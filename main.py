@@ -262,7 +262,7 @@ async def build_report(bot, chat_id, topic_id=None):
   Bull FVG    : {fvg_bull_str}
   Bear FVG    : {fvg_bear_str}
 
-💧 *LIQUIDITY*
+💸 *LIQUIDITY*
   🔵 Buy-Side  : {ext_buy}
   🔴 Sell-Side : {ext_sell}
   ⚖️ EQ Level  : {eq_str}
