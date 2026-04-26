@@ -2,8 +2,10 @@ import os
 import logging
 import datetime
 import requests
+import xml.etree.ElementTree as ET
 import pandas as pd
 import numpy as np
+import ccxt
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -23,55 +25,88 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 MY_CHAT_ID         = os.getenv("MY_CHAT_ID")
 TOPIC_ID           = os.getenv("TOPIC_ID")
+TOPIC_ALERT        = os.getenv("TOPIC_ALERT")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
+last_alert_time = {}
 
-# ── Twelve Data Fetcher ────────────────────────────────────────────────────────
 
-def get_xauusd_data():
-    """Fetch XAUUSD candles from Twelve Data — works weekends too."""
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA FETCHING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_exchange():
+    return ccxt.binance({
+        "enableRateLimit": True,
+        "options": {"defaultType": "spot"},
+    })
+
+
+def fetch_ohlcv(timeframe="1h", limit=200):
+    try:
+        exchange = get_exchange()
+        ohlcv    = exchange.fetch_ohlcv("PAXG/USDT", timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
+        df["Date"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            df[col] = df[col].astype(float)
+        return df
+    except Exception as e:
+        logger.warning(f"ccxt failed ({e}) — falling back to Twelve Data")
+        return fetch_twelvedata(timeframe, limit)
+
+
+def fetch_twelvedata(timeframe="1h", limit=200):
+    interval_map = {"1m": "1min", "5m": "5min", "1h": "1h", "1d": "1day"}
+    interval = interval_map.get(timeframe, "1h")
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol"    : "XAU/USD",
-        "interval"  : "1h",
-        "outputsize": 100,
+        "interval"  : interval,
+        "outputsize": limit,
         "apikey"    : TWELVEDATA_API_KEY,
     }
-    r = requests.get(url, params=params, timeout=10)
+    r    = requests.get(url, params=params, timeout=10)
     data = r.json()
-
     if "values" not in data:
-        raise ValueError(f"Twelve Data error: {data.get('message', 'Unknown error')}")
-
+        raise ValueError(f"Twelve Data error: {data.get('message', 'No data')}")
     df = pd.DataFrame(data["values"])
     df = df.rename(columns={
-        "datetime": "Date",
-        "open"    : "Open",
-        "high"    : "High",
-        "low"     : "Low",
-        "close"   : "Close",
+        "datetime": "Date", "open": "Open",
+        "high": "High", "low": "Low", "close": "Close",
     })
-    df["Date"]  = pd.to_datetime(df["Date"])
-    df["Open"]  = df["Open"].astype(float)
-    df["High"]  = df["High"].astype(float)
-    df["Low"]   = df["Low"].astype(float)
-    df["Close"] = df["Close"].astype(float)
+    df["Date"]   = pd.to_datetime(df["Date"])
+    df["Open"]   = df["Open"].astype(float)
+    df["High"]   = df["High"].astype(float)
+    df["Low"]    = df["Low"].astype(float)
+    df["Close"]  = df["Close"].astype(float)
+    df["Volume"] = 0.0
     df = df.sort_values("Date").reset_index(drop=True)
     return df
 
 
 def get_live_price():
-    """Get real-time XAUUSD price from Twelve Data."""
-    url = "https://api.twelvedata.com/price"
-    params = {"symbol": "XAU/USD", "apikey": TWELVEDATA_API_KEY}
-    r = requests.get(url, params=params, timeout=10)
-    data = r.json()
-    if "price" in data:
-        return round(float(data["price"]), 2)
+    try:
+        exchange = get_exchange()
+        ticker   = exchange.fetch_ticker("PAXG/USDT")
+        return round(float(ticker["last"]), 2)
+    except Exception:
+        try:
+            url    = "https://api.twelvedata.com/price"
+            params = {"symbol": "XAU/USD", "apikey": TWELVEDATA_API_KEY}
+            r      = requests.get(url, params=params, timeout=10)
+            data   = r.json()
+            if "price" in data:
+                return round(float(data["price"]), 2)
+        except Exception:
+            pass
     return None
 
 
-# ── Indicators ─────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# INDICATORS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -90,69 +125,6 @@ def calculate_macd(series):
     return macd, signal, histogram
 
 
-# ── Support & Resistance ───────────────────────────────────────────────────────
-
-def get_support_resistance(df):
-    resistance = round(df["High"].rolling(10).max().iloc[-1], 2)
-    support    = round(df["Low"].rolling(10).min().iloc[-1], 2)
-    return support, resistance
-
-
-# ── ICT Levels ─────────────────────────────────────────────────────────────────
-
-def get_ict_levels(df):
-    # Get daily data for PDH/PDL
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol"    : "XAU/USD",
-        "interval"  : "1day",
-        "outputsize": 5,
-        "apikey"    : TWELVEDATA_API_KEY,
-    }
-    r    = requests.get(url, params=params, timeout=10)
-    data = r.json()
-
-    pdh, pdl, pdc = None, None, None
-    if "values" in data and len(data["values"]) >= 2:
-        prev    = data["values"][1]  # previous day
-        pdh     = round(float(prev["high"]), 2)
-        pdl     = round(float(prev["low"]), 2)
-        pdc     = round(float(prev["close"]), 2)
-
-    eq_high = round(df["High"].tail(20).max(), 2)
-    eq_low  = round(df["Low"].tail(20).min(), 2)
-
-    fvg_bull, fvg_bear = None, None
-    for i in range(2, len(df)):
-        c0_high = df["High"].iloc[i - 2]
-        c2_low  = df["Low"].iloc[i]
-        c0_low  = df["Low"].iloc[i - 2]
-        c2_high = df["High"].iloc[i]
-        if c2_low > c0_high:
-            fvg_bull = (round(c0_high, 2), round(c2_low, 2))
-        if c2_high < c0_low:
-            fvg_bear = (round(c2_high, 2), round(c0_low, 2))
-
-    return pdh, pdl, pdc, eq_high, eq_low, fvg_bull, fvg_bear
-
-
-# ── Liquidity ──────────────────────────────────────────────────────────────────
-
-def get_liquidity(df, price, pdh, pdl):
-    spread      = round(pdh - pdl, 2) if pdh and pdl else "N/A"
-    equilibrium = round((pdh + pdl) / 2, 2) if pdh and pdl else None
-    ext_buy     = f"${pdh + 2:.2f}+" if pdh else "N/A"
-    ext_sell    = f"Below ${pdl - 2:.2f}" if pdl else "N/A"
-    int_status  = (
-        "Price above EQ — Seeking Buy-Side"
-        if equilibrium and price > equilibrium
-        else "Price below EQ — Seeking Sell-Side"
-    )
-    return ext_buy, ext_sell, equilibrium, int_status, spread
-
-
-# ── Trend ──────────────────────────────────────────────────────────────────────
-
 def get_trend(df):
     ema20 = df["Close"].ewm(span=20).mean().iloc[-1]
     ema50 = df["Close"].ewm(span=50).mean().iloc[-1]
@@ -165,74 +137,376 @@ def get_trend(df):
         return "⚖️ RANGING", "Mixed EMA signals"
 
 
-# ── Signal ─────────────────────────────────────────────────────────────────────
+def get_support_resistance(df):
+    resistance = round(df["High"].rolling(10).max().iloc[-1], 2)
+    support    = round(df["Low"].rolling(10).min().iloc[-1], 2)
+    return support, resistance
 
-def get_signal(rsi, macd_val, signal_val, trend):
-    if "BULLISH" in trend and rsi < 70 and macd_val > signal_val:
-        return "🟢 BUY", "Bullish trend + RSI healthy + MACD crossover"
-    elif "BEARISH" in trend and rsi > 30 and macd_val < signal_val:
-        return "🔴 SELL", "Bearish trend + RSI healthy + MACD crossunder"
-    elif rsi > 75:
-        return "⚠️ OVERBOUGHT", "RSI extreme — avoid buying"
-    elif rsi < 25:
-        return "⚠️ OVERSOLD", "RSI extreme — avoid selling"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SMC / ICT ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_daily_levels():
+    df  = fetch_ohlcv("1d", 5)
+    pdh = round(df["High"].iloc[-2], 2)
+    pdl = round(df["Low"].iloc[-2], 2)
+    pdc = round(df["Close"].iloc[-2], 2)
+    return pdh, pdl, pdc
+
+
+def get_session_levels(df_1h):
+    now   = datetime.datetime.utcnow()
+    today = now.date()
+    sessions = {
+        "Asia"  : (0,  8),
+        "London": (7,  16),
+        "NY"    : (13, 22),
+    }
+    result = {}
+    for session, (start_h, end_h) in sessions.items():
+        mask = (
+            (df_1h["Date"].dt.date == today) &
+            (df_1h["Date"].dt.hour >= start_h) &
+            (df_1h["Date"].dt.hour < end_h)
+        )
+        session_df = df_1h[mask]
+        if not session_df.empty:
+            result[session] = {
+                "high": round(session_df["High"].max(), 2),
+                "low" : round(session_df["Low"].min(), 2),
+            }
+        else:
+            result[session] = {"high": None, "low": None}
+    return result
+
+
+def detect_bos_choch(df_1h):
+    highs      = df_1h["High"].rolling(5).max()
+    lows       = df_1h["Low"].rolling(5).min()
+    last_close = df_1h["Close"].iloc[-1]
+    prev_high  = highs.iloc[-3]
+    prev_low   = lows.iloc[-3]
+    if last_close > prev_high:
+        return "BOS_BULLISH", f"Price broke above ${round(prev_high, 2)}"
+    elif last_close < prev_low:
+        return "BOS_BEARISH", f"Price broke below ${round(prev_low, 2)}"
     else:
-        return "⏳ WAIT", "No clear signal — stay patient"
+        return "NONE", "No structure break"
 
 
-# ── News ───────────────────────────────────────────────────────────────────────
+def detect_fvg(df):
+    fvg_bull, fvg_bear = None, None
+    for i in range(2, len(df)):
+        c0_high = df["High"].iloc[i - 2]
+        c2_low  = df["Low"].iloc[i]
+        c0_low  = df["Low"].iloc[i - 2]
+        c2_high = df["High"].iloc[i]
+        if c2_low > c0_high:
+            fvg_bull = (round(c0_high, 2), round(c2_low, 2))
+        if c2_high < c0_low:
+            fvg_bear = (round(c2_high, 2), round(c0_low, 2))
+    return fvg_bull, fvg_bear
+
+
+def detect_order_block(df):
+    ob_bull, ob_bear = None, None
+    for i in range(1, len(df) - 1):
+        curr   = df.iloc[i]
+        next_c = df.iloc[i + 1]
+        body_curr = abs(curr["Close"] - curr["Open"])
+        body_next = abs(next_c["Close"] - next_c["Open"])
+        if curr["Close"] < curr["Open"] and next_c["Close"] > next_c["Open"] and body_next > body_curr * 1.5:
+            ob_bull = (round(curr["Low"], 2), round(curr["High"], 2))
+        if curr["Close"] > curr["Open"] and next_c["Close"] < next_c["Open"] and body_next > body_curr * 1.5:
+            ob_bear = (round(curr["Low"], 2), round(curr["High"], 2))
+    return ob_bull, ob_bear
+
+
+def detect_sfp(df_5m, session_levels):
+    last     = df_5m.iloc[-1]
+    sfp_type  = None
+    sfp_level = None
+    for session, levels in session_levels.items():
+        s_high = levels["high"]
+        s_low  = levels["low"]
+        if s_high and last["High"] > s_high and last["Close"] < s_high:
+            sfp_type  = f"BEARISH SFP — {session} High Sweep"
+            sfp_level = s_high
+            break
+        if s_low and last["Low"] < s_low and last["Close"] > s_low:
+            sfp_type  = f"BULLISH SFP — {session} Low Sweep"
+            sfp_level = s_low
+            break
+    return sfp_type, sfp_level
+
+
+def get_volume_profile(df):
+    if df["Volume"].sum() == 0:
+        poc = round(df["Close"].median(), 2)
+        vah = round(df["High"].quantile(0.75), 2)
+        val = round(df["Low"].quantile(0.25), 2)
+        return poc, vah, val
+    price_min   = df["Low"].min()
+    price_max   = df["High"].max()
+    bins        = np.linspace(price_min, price_max, 50)
+    vol_profile = np.zeros(len(bins) - 1)
+    for _, row in df.iterrows():
+        for j in range(len(bins) - 1):
+            if bins[j] <= row["Close"] < bins[j + 1]:
+                vol_profile[j] += row["Volume"]
+                break
+    poc_idx   = np.argmax(vol_profile)
+    poc       = round((bins[poc_idx] + bins[poc_idx + 1]) / 2, 2)
+    total_vol = vol_profile.sum()
+    target    = total_vol * 0.70
+    upper, lower = poc_idx, poc_idx
+    covered   = vol_profile[poc_idx]
+    while covered < target and (upper < len(vol_profile) - 1 or lower > 0):
+        up_vol   = vol_profile[upper + 1] if upper < len(vol_profile) - 1 else 0
+        down_vol = vol_profile[lower - 1] if lower > 0 else 0
+        if up_vol >= down_vol:
+            upper   += 1
+            covered += up_vol
+        else:
+            lower   -= 1
+            covered += down_vol
+    vah = round((bins[upper] + bins[upper + 1]) / 2, 2)
+    val = round((bins[lower] + bins[lower + 1]) / 2, 2)
+    return poc, vah, val
+
+
+def is_near_level(price, level, pct=0.002):
+    if level is None:
+        return False
+    return abs(price - level) / level < pct
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEWS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def get_economic_news():
+    sources = [
+        "https://www.fxstreet.com/rss/news",
+        "https://www.forexlive.com/feed/news",
+    ]
+    headlines = []
+    for url in sources:
+        try:
+            r    = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+            root = ET.fromstring(r.content)
+            for item in root.iter("item"):
+                title    = item.findtext("title", "").strip()
+                keywords = ["gold", "xau", "fed", "rate", "inflation", "dollar", "fomc", "powell"]
+                if any(k in title.lower() for k in keywords):
+                    headlines.append(title)
+                if len(headlines) >= 4:
+                    break
+        except Exception:
+            continue
+        if len(headlines) >= 4:
+            break
+    return headlines[:4] if headlines else ["No gold-related news found"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SMC SIGNAL CHECKER — every 1 minute
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def smc_signal_check(bot):
+    global last_alert_time
     try:
-        key = os.getenv("GNEWS_API_KEY", "")
-        if not key:
-            return ["Add GNEWS_API_KEY to Railway Variables for live news"]
-        r = requests.get(
-            "https://gnews.io/api/v4/search",
-            params={"q": "gold XAUUSD federal reserve", "lang": "en", "max": 3, "token": key},
-            timeout=5,
+        today = datetime.datetime.utcnow().weekday()
+        if today >= 5:
+            return
+
+        now   = datetime.datetime.utcnow()
+        price = get_live_price()
+        if not price:
+            return
+
+        df_1h = fetch_ohlcv("1h", 200)
+        df_5m = fetch_ohlcv("5m", 100)
+
+        pdh, pdl, pdc  = get_daily_levels()
+        equilibrium    = round((pdh + pdl) / 2, 2)
+        daily_bias     = "BULLISH" if price > equilibrium else "BEARISH"
+        session_levels = get_session_levels(df_1h)
+        bos_type, bos_reason = detect_bos_choch(df_1h)
+
+        fvg_bull_5m, fvg_bear_5m = detect_fvg(df_5m)
+        ob_bull_5m,  ob_bear_5m  = detect_order_block(df_5m)
+        sfp_type, sfp_level      = detect_sfp(df_5m, session_levels)
+
+        poc, vah, val = get_volume_profile(df_1h)
+        near_vp = (
+            is_near_level(price, poc) or
+            is_near_level(price, vah) or
+            is_near_level(price, val)
         )
-        if r.status_code == 200:
-            return [a["title"] for a in r.json().get("articles", [])[:3]]
-    except Exception:
-        pass
-    return ["News unavailable"]
+
+        rsi_series = calculate_rsi(df_1h["Close"])
+        rsi        = round(rsi_series.iloc[-1], 2)
+
+        signal_type   = None
+        signal_reason = []
+
+        buy_conditions = [
+            daily_bias == "BULLISH",
+            "BULLISH" in bos_type,
+            rsi < 65,
+            near_vp,
+            (
+                (sfp_type and "BULLISH" in sfp_type) or
+                (fvg_bull_5m and is_near_level(price, fvg_bull_5m[0])) or
+                (ob_bull_5m  and is_near_level(price, ob_bull_5m[0]))
+            ),
+        ]
+
+        sell_conditions = [
+            daily_bias == "BEARISH",
+            "BEARISH" in bos_type,
+            rsi > 35,
+            near_vp,
+            (
+                (sfp_type and "BEARISH" in sfp_type) or
+                (fvg_bear_5m and is_near_level(price, fvg_bear_5m[1])) or
+                (ob_bear_5m  and is_near_level(price, ob_bear_5m[1]))
+            ),
+        ]
+
+        if all(buy_conditions):
+            signal_type = "BUY"
+            if sfp_type and "BULLISH" in sfp_type:
+                signal_reason.append(sfp_type)
+            if fvg_bull_5m:
+                signal_reason.append(f"5m Bull FVG ${fvg_bull_5m[0]}–${fvg_bull_5m[1]}")
+            if ob_bull_5m:
+                signal_reason.append(f"5m Bull OB ${ob_bull_5m[0]}–${ob_bull_5m[1]}")
+            signal_reason.append(bos_reason)
+            signal_reason.append(f"Near VP Level (POC ${poc})")
+
+        elif all(sell_conditions):
+            signal_type = "SELL"
+            if sfp_type and "BEARISH" in sfp_type:
+                signal_reason.append(sfp_type)
+            if fvg_bear_5m:
+                signal_reason.append(f"5m Bear FVG ${fvg_bear_5m[0]}–${fvg_bear_5m[1]}")
+            if ob_bear_5m:
+                signal_reason.append(f"5m Bear OB ${ob_bear_5m[0]}–${ob_bear_5m[1]}")
+            signal_reason.append(bos_reason)
+            signal_reason.append(f"Near VP Level (POC ${poc})")
+
+        if not signal_type:
+            return
+
+        last = last_alert_time.get(signal_type)
+        if last and (now - last).seconds < 7200:
+            return
+
+        last_alert_time[signal_type] = now
+
+        atr = round(df_1h["High"].tail(14).mean() - df_1h["Low"].tail(14).mean(), 2)
+        if signal_type == "BUY":
+            sl    = round(price - atr, 2)
+            tp    = round(price + atr * 2, 2)
+            emoji = "🟢"
+        else:
+            sl    = round(price + atr, 2)
+            tp    = round(price - atr * 2, 2)
+            emoji = "🔴"
+
+        reason_text = "\n    ".join(signal_reason)
+        now_str     = now.strftime("%Y-%m-%d %H:%M UTC")
+
+        alert = f"""
+⚡ *E11 SMC SIGNAL ALERT*
+🕐 {now_str}
+
+{emoji} *{signal_type} — XAUUSD*
+💰 Price : *${price}*
+🎯 TP    : ${tp}
+🛑 SL    : ${sl}
+
+📋 *Reason:*
+    {reason_text}
+
+📊 *Context:*
+  Daily Bias : {daily_bias}
+  1H BOS     : {bos_type}
+  RSI (1H)   : {rsi}
+  POC        : ${poc}
+  VAH        : ${vah}
+  VAL        : ${val}
+  PDH        : ${pdh}
+  PDL        : ${pdl}
+
+━━━━━━━━━━━━━━━━━━━
+_E11 Sniper Bot • Educational use only_
+"""
+        kwargs = {
+            "chat_id"   : MY_CHAT_ID,
+            "text"      : alert.strip(),
+            "parse_mode": "Markdown",
+        }
+        if TOPIC_ALERT:
+            kwargs["message_thread_id"] = int(TOPIC_ALERT)
+        await bot.send_message(**kwargs)
+        logger.info(f"⚡ SMC Alert sent: {signal_type} @ ${price}")
+
+    except Exception as e:
+        logger.error(f"❌ SMC check error: {e}", exc_info=True)
 
 
-# ── Report Builder ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# REPORT BUILDER
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def build_report(bot, chat_id, topic_id=None):
     try:
-        df = get_xauusd_data()
-
-        # Try live price first, fall back to last candle
+        df_1h      = fetch_ohlcv("1h", 200)
         live_price = get_live_price()
-        price      = live_price if live_price else round(df["Close"].iloc[-1], 2)
-        high       = round(df["High"].iloc[-1], 2)
-        low        = round(df["Low"].iloc[-1], 2)
+        price      = live_price if live_price else round(df_1h["Close"].iloc[-1], 2)
+        high       = round(df_1h["High"].iloc[-1], 2)
+        low        = round(df_1h["Low"].iloc[-1], 2)
 
-        last_candle_time = df["Date"].iloc[-1].strftime("%Y-%m-%d %H:%M UTC")
+        last_candle_time = df_1h["Date"].iloc[-1].strftime("%Y-%m-%d %H:%M UTC")
 
-        rsi_series         = calculate_rsi(df["Close"])
+        rsi_series         = calculate_rsi(df_1h["Close"])
         rsi                = round(rsi_series.iloc[-1], 2)
-        macd, signal, hist = calculate_macd(df["Close"])
+        macd, signal, hist = calculate_macd(df_1h["Close"])
         macd_val           = round(macd.iloc[-1], 2)
         signal_val         = round(signal.iloc[-1], 2)
         hist_val           = round(hist.iloc[-1], 2)
 
-        support, resistance                                  = get_support_resistance(df)
-        trend_label, trend_reason                            = get_trend(df)
-        pdh, pdl, pdc, eq_high, eq_low, fvg_bull, fvg_bear  = get_ict_levels(df)
-        signal_label, sig_reason                             = get_signal(rsi, macd_val, signal_val, trend_label)
-        ext_buy, ext_sell, equilibrium, int_status, spread   = get_liquidity(df, price, pdh, pdl)
+        support, resistance  = get_support_resistance(df_1h)
+        trend_label, trend_r = get_trend(df_1h)
+        pdh, pdl, pdc        = get_daily_levels()
+        equilibrium          = round((pdh + pdl) / 2, 2)
+        daily_bias           = "📈 BULLISH" if price > equilibrium else "📉 BEARISH"
+
+        fvg_bull, fvg_bear   = detect_fvg(df_1h)
+        ob_bull,  ob_bear    = detect_order_block(df_1h)
+        bos_type, bos_reason = detect_bos_choch(df_1h)
+        session_levels       = get_session_levels(df_1h)
+        poc, vah, val        = get_volume_profile(df_1h)
+
+        fvg_bull_str = f"${fvg_bull[0]} – ${fvg_bull[1]}" if fvg_bull else "None"
+        fvg_bear_str = f"${fvg_bear[0]} – ${fvg_bear[1]}" if fvg_bear else "None"
+        ob_bull_str  = f"${ob_bull[0]} – ${ob_bull[1]}"   if ob_bull  else "None"
+        ob_bear_str  = f"${ob_bear[0]} – ${ob_bear[1]}"   if ob_bear  else "None"
+        rsi_label    = "🔥 Overbought" if rsi > 70 else "🧊 Oversold" if rsi < 30 else "✅ Neutral"
+
+        session_text = ""
+        for s, lvl in session_levels.items():
+            if lvl["high"]:
+                session_text += f"  {s}: H ${lvl['high']} | L ${lvl['low']}\n"
+        if not session_text:
+            session_text = "  No session data yet today\n"
 
         news       = get_economic_news()
         news_lines = "\n".join([f"  • {n}" for n in news])
-
-        fvg_bull_str = f"${fvg_bull[0]} – ${fvg_bull[1]}" if fvg_bull else "None detected"
-        fvg_bear_str = f"${fvg_bear[0]} – ${fvg_bear[1]}" if fvg_bear else "None detected"
-        rsi_label    = "🔥 Overbought" if rsi > 70 else "🧊 Oversold" if rsi < 30 else "✅ Neutral"
-        eq_str       = f"${equilibrium}" if equilibrium else "N/A"
 
         today        = datetime.datetime.utcnow().weekday()
         weekend_note = "\n⚠️ _Weekend — showing last available data_\n" if today >= 5 else ""
@@ -242,50 +516,46 @@ async def build_report(bot, chat_id, topic_id=None):
 🕐 {last_candle_time}{weekend_note}
 💰 *PRICE*
   Current : *${price}*
-  H1 High : ${high}
-  H1 Low  : ${low}
+  H1 High : ${high}  |  H1 Low : ${low}
 
-📊 *TREND*
-  {trend_label}
-  _{trend_reason}_
+📊 *DAILY BIAS*
+  {daily_bias}
+  EQ Level : ${equilibrium}
 
-📐 *SUPPORT & RESISTANCE*
-  🟢 Support    : ${support}
-  🔴 Resistance : ${resistance}
+🔍 *1H STRUCTURE*
+  {bos_type} — _{bos_reason}_
+  Trend : {trend_label}
 
-🧠 *ICT KEY LEVELS*
-  PDH         : ${pdh}
-  PDL         : ${pdl}
-  PDC         : ${pdc}
-  Equal Highs : ${eq_high}
-  Equal Lows  : ${eq_low}
-  Bull FVG    : {fvg_bull_str}
-  Bear FVG    : {fvg_bear_str}
+📐 *KEY LEVELS*
+  PDH : ${pdh}  |  PDL : ${pdl}  |  PDC : ${pdc}
+  Support    : ${support}
+  Resistance : ${resistance}
 
-💸 *LIQUIDITY*
-  🔵 Buy-Side  : {ext_buy}
-  🔴 Sell-Side : {ext_sell}
-  ⚖️ EQ Level  : {eq_str}
-  📍 Internal  : {int_status}
-  📏 Day Range : ${spread}
+🧠 *ICT CONCEPTS*
+  Bull FVG : {fvg_bull_str}
+  Bear FVG : {fvg_bear_str}
+  Bull OB  : {ob_bull_str}
+  Bear OB  : {ob_bear_str}
 
+📊 *VOLUME PROFILE*
+  POC : ${poc}
+  VAH : ${vah}
+  VAL : ${val}
+
+⏰ *SESSION LEVELS*
+{session_text}
 📈 *INDICATORS*
   RSI (14)  : {rsi} {rsi_label}
   MACD      : {macd_val}
   Signal    : {signal_val}
   Histogram : {hist_val} {'▲' if hist_val > 0 else '▼'}
 
-🎯 *SIGNAL*
-  {signal_label}
-  _{sig_reason}_
-
-📰 *NEWS*
+📰 *GOLD & MACRO NEWS*
 {news_lines}
 
 ━━━━━━━━━━━━━━━━━━━
 _E11 Sniper Bot • Educational use only_
 """
-
         kwargs = {
             "chat_id"   : chat_id,
             "text"      : report.strip(),
@@ -293,7 +563,6 @@ _E11 Sniper Bot • Educational use only_
         }
         if topic_id:
             kwargs["message_thread_id"] = int(topic_id)
-
         await bot.send_message(**kwargs)
         logger.info("✅ Report sent.")
 
@@ -306,7 +575,9 @@ _E11 Sniper Bot • Educational use only_
         )
 
 
-# ── Handlers ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# HANDLERS
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -327,59 +598,4 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def instant_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today = datetime.datetime.utcnow().weekday()
-    if today >= 5:
-        await update.message.reply_text(
-            "📅 *Weekend Mode — Last Available Data*\n"
-            "_(Markets closed — fetching last candle...)_",
-            parse_mode="Markdown",
-        )
-    else:
-        await update.message.reply_text("⏳ Analyzing XAUUSD market...")
-    await build_report(context.bot, update.effective_chat.id, TOPIC_ID)
-
-
-async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❓ Unknown command. Try /help.")
-
-
-# ── Main ───────────────────────────────────────────────────────────────────────
-
-def main():
-    if not BOT_TOKEN:
-        raise EnvironmentError("BOT_TOKEN is not set!")
-    if not MY_CHAT_ID:
-        raise EnvironmentError("MY_CHAT_ID is not set!")
-    if not TWELVEDATA_API_KEY:
-        raise EnvironmentError("TWELVEDATA_API_KEY is not set!")
-
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start",  start))
-    application.add_handler(CommandHandler("help",   help_command))
-    application.add_handler(CommandHandler("report", instant_report))
-    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
-
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(
-        build_report,
-        trigger="cron",
-        hour=9,
-        minute=0,
-        args=[application.bot, MY_CHAT_ID, TOPIC_ID],
-        id="daily_report",
-        replace_existing=True,
-        misfire_grace_time=3600,
-    )
-    scheduler.start()
-    logger.info("🚀 E11 Sniper Bot Is Running... Waiting for commands.")
-
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
-
-
-if __name__ == "__main__":
-    main()
+async def instant_report(update: Update, 
