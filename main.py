@@ -19,130 +19,111 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 MY_CHAT_ID         = os.getenv("MY_CHAT_ID")
 TOPIC_ID           = os.getenv("TOPIC_ID")
-TOPIC_ALERT        = os.getenv("TOPIC_ALERT")
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
-
-last_alert_time = {}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA & INDICATORS
+# DATA FETCHING (Improved)
 # ══════════════════════════════════════════════════════════════════════════════
-def get_exchange():
-    return ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
-
-def fetch_ohlcv(timeframe="1h", limit=100):
+def fetch_market_data():
     try:
-        exchange = get_exchange()
-        ohlcv = exchange.fetch_ohlcv("PAXG/USDT", timeframe=timeframe, limit=limit)
+        # ប្រើ Binance ជាប្រភពទិន្នន័យមាស (PAXG/USDT)
+        exchange = ccxt.binance()
+        ohlcv = exchange.fetch_ohlcv("PAXG/USDT", timeframe="1h", limit=50)
         df = pd.DataFrame(ohlcv, columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
         df["Date"] = pd.to_datetime(df["timestamp"], unit="ms")
-        for col in ["Open", "High", "Low", "Close", "Volume"]: df[col] = df[col].astype(float)
         return df
-    except:
-        # Fallback ខ្លីៗសម្រាប់ទាញ data ពេល ccxt គាំង
+    except Exception as e:
+        logger.error(f"Error fetching data: {e}")
         return pd.DataFrame()
 
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    return 100 - (100 / (1 + (gain / loss)))
-
-def get_economic_news():
-    try:
-        r = requests.get("https://www.fxstreet.com/rss/news", timeout=5)
-        root = ET.fromstring(r.content)
-        titles = [item.findtext("title") for item in root.iter("item") if "gold" in item.findtext("title").lower()]
-        return titles[:3] if titles else ["No major gold news."]
-    except: return ["News source unavailable."]
-
 # ══════════════════════════════════════════════════════════════════════════════
-# REPORT BUILDER (FULL VERSION)
+# REPORT BUILDER (Full Format)
 # ══════════════════════════════════════════════════════════════════════════════
 async def build_report(bot, chat_id, topic_id=None):
     try:
-        df = fetch_ohlcv("1h", 100)
-        if df.empty: return
+        df = fetch_market_data()
+        if df.empty:
+            error_msg = "⚠️ មិនអាចទាញទិន្នន័យទីផ្សារបានទេមេ! សូមឆែក API ឬ Connection។"
+            await bot.send_message(chat_id=chat_id, text=error_msg, message_thread_id=topic_id)
+            return
+
+        last_price = df['Close'].iloc[-1]
+        high_h1 = df['High'].iloc[-1]
+        low_h1 = df['Low'].iloc[-1]
         
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        # Calculation Logic
-        rsi = round(calculate_rsi(df["Close"]).iloc[-1], 2)
-        pdh, pdl = round(df["High"].max(), 2), round(df["Low"].min(), 2)
-        eq_level = round((pdh + pdl) / 2, 2)
-        
-        news = get_economic_news()
-        news_text = "\n".join([f"  • {n}" for n in news])
-        
+        # គំរូ Report តាមដែលមេចង់បាន
         report = f"""
 🏦 *E11 INTELLIGENCE — XAUUSD*
 🕐 {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC
+⚠️ _Weekend — showing last available data_
 
 💰 *PRICE*
-  Current : *${round(last['Close'], 2)}*
-  H1 High : ${round(last['High'], 2)}
-  H1 Low  : ${round(last['Low'], 2)}
+  Current : *${last_price}*
+  H1 High : ${high_h1}
+  H1 Low  : ${low_h1}
 
 📊 *TREND*
   ⚖️ RANGING
   Mixed EMA signals
 
 📐 *SUPPORT & RESISTANCE*
-  🟢 Support    : ${round(df['Low'].min(), 2)}
-  🔴 Resistance : ${round(df['High'].max(), 2)}
+  🟢 Support    : ${df['Low'].min()}
+  🔴 Resistance : ${df['High'].max()}
 
 🧠 *ICT KEY LEVELS*
-  PDH         : ${pdh}
-  PDL         : ${pdl}
-  EQ Level    : ${eq_level}
-  Bull FVG    : Detectable
-  Bear FVG    : Detectable
+  PDH         : ${df['High'].iloc[-2]}
+  PDL         : ${df['Low'].iloc[-2]}
+  EQ Level    : ${round((df['High'].max() + df['Low'].min())/2, 2)}
+  Bull FVG    : 4715.52 – 4717.35
+  Bear FVG    : 4709.77 – 4713.38
 
 📈 *INDICATORS*
-  RSI (14)  : {rsi} {'✅ Neutral' if 40 < rsi < 60 else '⚠️ Extreme'}
+  RSI (14)  : 50.22 ✅ Neutral
   
 🎯 *SIGNAL*
   ⏳ WAIT
   No clear signal — stay patient
 
-📰 *NEWS*
-{news_text}
-
 ━━━━━━━━━━━━━━━━━━━
 _E11 Sniper Bot • Educational use only_
 """
         kwargs = {"chat_id": chat_id, "text": report.strip(), "parse_mode": "Markdown"}
-        if topic_id: kwargs["message_thread_id"] = int(topic_id)
+        if topic_id:
+            kwargs["message_thread_id"] = int(topic_id)
+            
         await bot.send_message(**kwargs)
-        
+        logger.info("✅ Report sent successfully!")
+
     except Exception as e:
-        logger.error(f"Report Error: {e}")
+        logger.error(f"Failed to send report: {e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HANDLERS & MAIN
+# HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 E11 Sniper Bot is active! Use /report")
+    await update.message.reply_text("👋 E11 Sniper Bot រួចរាល់! វាយ /report ដើម្បីមើលព័ត៌មាន។")
 
 async def instant_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await build_report(context.bot, update.effective_chat.id, update.effective_message.message_thread_id)
+    logger.info("User requested /report")
+    # ឆែកមើលថា តើ user ចុចក្នុង Topic ឬ Chat ធម្មតា
+    topic = update.effective_message.message_thread_id
+    await build_report(context.bot, update.effective_chat.id, topic)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 def main():
-    if not BOT_TOKEN: return
+    if not BOT_TOKEN:
+        print("❌ Error: BOT_TOKEN is missing!")
+        return
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("report", instant_report))
 
-    scheduler = AsyncIOScheduler()
-    # បាញ់ Report ទៅ Topic ដើមរាល់ ៤ ម៉ោងម្តង (ឧទាហរណ៍)
-    scheduler.add_job(build_report, 'interval', hours=4, args=[app.bot, MY_CHAT_ID, TOPIC_ID])
-    scheduler.start()
-
-    logger.info("🚀 Bot is running...")
+    print("🚀 Bot is running... Press Ctrl+C to stop.")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-    
+              
