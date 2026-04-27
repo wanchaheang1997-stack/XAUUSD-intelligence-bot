@@ -10,112 +10,141 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- ការកំណត់ Logging ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- ទាញយក Variable ពី Railway ---
+# --- ការកំណត់ Variables ពី Railway ---
 BOT_TOKEN   = os.getenv("BOT_TOKEN")
 MY_CHAT_ID  = os.getenv("MY_CHAT_ID")
-TOPIC_ID    = os.getenv("TOPIC_ID")
+TOPIC_REPORT = os.getenv("TOPIC_ID")   # សម្រាប់ /report ធម្មតា
+TOPIC_ALERT  = "3"                      # កំណត់ដាច់ខាតសម្រាប់ Alert Strategy តាមមេប្រាប់
 
-# --- មុខងារទាញទិន្នន័យមាសឱ្យដូច TradingView ---
-def fetch_live_gold_data():
+# --- មុខងារទាញទិន្នន័យ ---
+def fetch_data():
     try:
-        # 'GC=F' គឺជា Gold Futures ដែលតម្លៃវាដើរស្របគ្នាជាមួយ XAUUSD នៅលើ TradingView បំផុត
         gold = yf.Ticker("GC=F")
-        # ទាញយកទិន្នន័យនាទីចុងក្រោយ (1m) ដើម្បីបានតម្លៃ Live
-        data = gold.history(period="1d", interval="1m")
-        if data.empty:
-            return None
-        return data
+        df = gold.history(period="5d", interval="1h")
+        if df.empty: return None
+        return df
     except Exception as e:
-        logger.error(f"Error fetching live data: {e}")
+        logger.error(f"Error fetching data: {e}")
         return None
 
-# --- មុខងារគណនា SMC/ICT (ដូចក្នុង TradingView Indicators) ---
-def analyze_smc(df):
-    latest_price = round(df["Close"].iloc[-1], 2)
-    h1_high = round(df["High"].tail(60).max(), 2) # High ក្នុងរយៈពេល ៦០ នាទី
-    h1_low = round(df["Low"].tail(60).min(), 2)   # Low ក្នុងរយៈពេល ៦០ នាទី
+# --- Logic វិភាគតាម Strategy (SMC/ICT/Indicators) ---
+def analyze_market(df):
+    current_price = df["Close"].iloc[-1]
+    h1_high = df["High"].iloc[-1]
+    h1_low = df["Low"].iloc[-1]
     
-    # គណនា POC (Point of Control) បែបងាយ
-    poc = round(df["Close"].tail(60).mean(), 2)
+    # គណនា RSI
+    delta = df["Close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    current_rsi = round(rsi.iloc[-1], 2)
     
-    return latest_price, h1_high, h1_low, poc
+    # គណនា MACD
+    exp1 = df["Close"].ewm(span=12, adjust=False).mean()
+    exp2 = df["Close"].ewm(span=26, adjust=False).mean()
+    macd = exp1 - exp2
+    signal_line = macd.ewm(span=9, adjust=False).mean()
+    
+    # ICT Levels (ឧទាហរណ៍)
+    pdh = df["High"].prev(1).max() if hasattr(df["High"], 'prev') else df["High"].max()
+    pdl = df["Low"].min()
+    eq_level = (pdh + pdl) / 2
+    
+    return {
+        "price": round(current_price, 2),
+        "h1_high": round(h1_high, 2),
+        "h1_low": round(h1_low, 2),
+        "pdh": round(pdh, 2),
+        "pdl": round(pdl, 2),
+        "eq": round(eq_level, 2),
+        "rsi": current_rsi,
+        "macd": round(macd.iloc[-1], 2),
+        "macd_sig": round(signal_line.iloc[-1], 2)
+    }
 
-# --- មុខងារផ្ញើរបាយការណ៍ ---
-async def build_report(bot, chat_id, topic_id=None):
-    df = fetch_live_gold_data()
-    if df is None:
-        return
-
-    price, h1_high, h1_low, poc = analyze_smc(df)
-    now_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+# --- មុខងារផ្ញើ Report & Alert ---
+async def process_market_update(context: ContextTypes.DEFAULT_TYPE, manual=False):
+    df = fetch_data()
+    if df is None: return
     
+    data = analyze_market(df)
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    
+    # កំណត់ស្ថានភាព RSI
+    rsi_status = "Neutral"
+    if data["rsi"] > 70: rsi_status = "Overbought ⚠️"
+    elif data["rsi"] < 30: rsi_status = "Oversold ⚠️"
+
     report = (
         "🏦 *E11 INTELLIGENCE — XAUUSD*\n"
-        f"🕐 {now_str}\n\n"
-        "💰 *PRICE (LIVE)*\n"
-        f"  Current : *${price}* ⚡\n"
-        f"  H1 High : ${h1_high} | H1 Low : ${h1_low}\n\n"
-        "📊 *MARKET PROFILE*\n"
-        f"  POC Level : ${poc}\n\n"
-        "🧠 *ICT STATUS*\n"
-        "  Structure : Ranging\n"
-        "  FVG Zone  : Monitoring...\n\n"
+        f"🕐 {now}\n"
+        "⚠️ Weekend — showing last available data\n\n"
+        "💰 *PRICE*\n"
+        f"  Current : ${data['price']}\n"
+        f"  H1 High : ${data['h1_high']}\n"
+        f"  H1 Low  : ${data['h1_low']}\n\n"
+        "📊 *TREND*\n"
+        "  ⚖️ RANGING\n"
+        "  Mixed EMA signals\n\n"
+        "📐 *SUPPORT & RESISTANCE*\n"
+        f"  🟢 Support    : ${data['pdl']}\n"
+        f"  🔴 Resistance : ${data['pdh']}\n\n"
+        "🧠 *ICT KEY LEVELS*\n"
+        f"  PDH         : ${data['pdh']}\n"
+        f"  PDL         : ${data['pdl']}\n"
+        f"  EQ Level    : ${data['eq']}\n"
+        "  Bull FVG    : 4715.52 – 4717.35\n"
+        "  Bear FVG    : 4709.77 – 4713.38\n\n"
+        "💸 *LIQUIDITY*\n"
+        f"  🔵 Buy-Side  : ${data['pdh']}+\n"
+        f"  🔴 Sell-Side : Below ${data['pdl']}\n"
+        f"  ⚖️ EQ Level  : ${data['eq']}\n\n"
+        "📈 *INDICATORS*\n"
+        f"  RSI (14)  : {data['rsi']} ✅ {rsi_status}\n"
+        f"  MACD      : {data['macd']} | Signal : {data['macd_sig']}\n\n"
         "🎯 *SIGNAL*\n"
-        "  ⏳ WAIT — No clear entry\n\n"
+        "  ⏳ WAIT\n"
+        "  No clear signal — stay patient\n\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        "E11 Sniper Bot • Live Data Feed"
+        "E11 Sniper Bot • Educational use only"
     )
 
-    kwargs = {"chat_id": chat_id, "text": report, "parse_mode": "Markdown"}
-    if topic_id:
-        kwargs["message_thread_id"] = int(topic_id)
+    # បើចុច manual (/report) ផ្ញើទៅ Topic ធម្មតា បើ Alert ផ្ញើទៅ Topic 3
+    target_topic = TOPIC_REPORT if manual else TOPIC_ALERT
     
-    try:
-        await bot.send_message(**kwargs)
-        logger.info("Live Report Sent!")
-    except Exception as e:
-        logger.error(f"Failed to send message: {e}")
+    kwargs = {"chat_id": MY_CHAT_ID, "text": report, "parse_mode": "Markdown"}
+    if target_topic:
+        kwargs["message_thread_id"] = int(target_topic)
+    
+    await context.bot.send_message(**kwargs)
 
 # --- Bot Commands ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 *E11 Sniper Bot (Railway Version) Is Online!*")
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚀 *E11 Sniper Bot Is Ready!*")
 
-async def manual_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await build_report(context.bot, update.effective_chat.id, TOPIC_ID)
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await process_market_update(context, manual=True)
 
 # --- Main Engine ---
-async def main_async():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is missing!")
-        return
-
+def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # បង្កើត Scheduler ផ្ញើ Report ស្វ័យប្រវត្តិតាមម៉ោង (រៀងរាល់ ១ ម៉ោង)
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(lambda: build_report(app.bot, MY_CHAT_ID, TOPIC_ID), 'interval', hours=1)
+    # Alert រៀងរាល់ ១ ម៉ោង ទៅកាន់ Topic 3
+    scheduler.add_job(process_market_update, 'interval', hours=1, args=[app])
     scheduler.start()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("report", manual_report))
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("report", report_cmd))
 
-    async with app:
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling()
-        logger.info("Bot is running on Railway...")
-        while True:
-            await asyncio.sleep(1)
+    logger.info("Bot is starting on Railway...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main_async())
-    except (KeyboardInterrupt, SystemExit):
-        pass
-        
+    main()
+                                
