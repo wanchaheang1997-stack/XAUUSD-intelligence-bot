@@ -10,20 +10,19 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.error import BadRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# --- ការកំណត់ Logging ---
+# --- Logging Setup ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- ការកំណត់ Variables ពី Railway ---
+# --- Environment Variables ---
 BOT_TOKEN   = os.getenv("BOT_TOKEN")
 MY_CHAT_ID  = os.getenv("MY_CHAT_ID")
-TOPIC_ID    = os.getenv("TOPIC_ID") # លេខ ID សម្រាប់ Topic ធម្មតា
-ALERT_TOPIC = "3"                  # Topic សម្រាប់ផ្ញើតាមម៉ោង (Alert)
+TOPIC_ID    = os.getenv("TOPIC_ID")
+ALERT_TOPIC = "3"
 
-# --- មុខងារទាញទិន្នន័យ និងវិភាគ ---
+# --- Market Analysis Function ---
 async def get_market_analysis():
     try:
-        # GC=F (Gold Futures) សម្រាប់តម្លៃមាស Live
         gold = yf.Ticker("GC=F")
         df = gold.history(period="5d", interval="1h")
         if df.empty: return None
@@ -31,13 +30,10 @@ async def get_market_analysis():
         price = round(df["Close"].iloc[-1], 2)
         high = round(df["High"].iloc[-1], 2)
         low = round(df["Low"].iloc[-1], 2)
-        
-        # Support/Resistance ងាយៗ
         res = round(df["High"].max(), 2)
         sup = round(df["Low"].min(), 2)
         eq = round((res + sup) / 2, 2)
 
-        # RSI (14)
         delta = df["Close"].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -49,17 +45,15 @@ async def get_market_analysis():
         logger.error(f"Analysis Error: {e}")
         return None
 
-# --- មុខងារបង្កើត និងផ្ញើ Report ---
+# --- Report Sending Function ---
 async def send_full_report(context: ContextTypes.DEFAULT_TYPE, is_scheduled=False):
     data = await get_market_analysis()
     if not data: return
 
-    # កំណត់ម៉ោងកម្ពុជា
     kh_tz = pytz.timezone('Asia/Phnom Penh')
     now_kh = datetime.datetime.now(kh_tz)
     time_str = now_kh.strftime("%Y-%m-%d %H:%M")
     
-    # ឆែកស្ថានភាពផ្សារ (ចន្ទ-សុក្រ = Open)
     status = "🟢 Market is Open — Live Data" if now_kh.weekday() < 5 else "⚠️ Weekend — Showing Last Data"
 
     report = (
@@ -96,7 +90,6 @@ async def send_full_report(context: ContextTypes.DEFAULT_TYPE, is_scheduled=Fals
         "E11 Sniper Bot • Educational use only"
     )
 
-    # បើផ្ញើតាមម៉ោង (Scheduled) ឱ្យចូល Topic 3, បើចុច /report ឱ្យចូល Topic ធម្មតា
     thread_id = ALERT_TOPIC if is_scheduled else TOPIC_ID
     
     try:
@@ -106,40 +99,55 @@ async def send_full_report(context: ContextTypes.DEFAULT_TYPE, is_scheduled=Fals
             message_thread_id=thread_id,
             parse_mode="Markdown"
         )
-    except BadRequest as e:
-        logger.warning(f"Thread ID {thread_id} not found, sending to main chat.")
-        await context.bot.send_message(chat_id=MY_CHAT_ID, text=report, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Send Error: {e}")
 
 # --- Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 E11 Sniper Bot is Ready! Timezone: Cambodia")
+    await update.message.reply_text("🚀 E11 Sniper Bot is Online (KH Timezone)!")
 
 async def manual_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_full_report(context, is_scheduled=False)
 
-# --- Main Engine ---
+# --- 🛠 កែសម្រួលត្រង់ចំណុចនេះដើម្បីដោះស្រាយ Error ---
 async def main():
+    # 1. បង្កើត Application
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # 2. កំណត់ Timezone សម្រាប់ Scheduler
     kh_tz = pytz.timezone('Asia/Phnom Penh')
-
-    # កំណត់ Scheduler ផ្ញើ ៣ ពេល (8:00, 14:00, 19:00)
     scheduler = AsyncIOScheduler(timezone=kh_tz)
-    
-    # បន្ថែមការងារសម្រាប់ផ្ញើស្វ័យប្រវត្តិ
-    for hour in [8, 14, 19]:
-        scheduler.add_job(send_full_report, 'cron', hour=hour, minute=0, args=[app, True])
-    
-    scheduler.start()
 
+    # 3. បន្ថែមការងារសម្រាប់ផ្ញើស្វ័យប្រវត្តិ (8, 14, 19)
+    for hr in [8, 14, 19]:
+        scheduler.add_job(
+            send_full_report, 
+            'cron', 
+            hour=hr, 
+            minute=0, 
+            args=[app], # ផ្ញើ app context ទៅឱ្យ function
+            name=f"Report_{hr}h"
+        )
+
+    # 4. បន្ថែម Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("report", manual_report))
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Bot is running with Cambodia Timezone...")
-    await asyncio.Event().wait()
+    # 5. ចាប់ផ្តើមដំណើរការ
+    async with app:
+        await app.initialize()
+        await app.start()
+        scheduler.start() # បញ្ជាឱ្យ Scheduler ដើរបន្ទាប់ពី App ចាប់ផ្តើម
+        logger.info("Bot & Scheduler are running...")
+        await app.updater.start_polling(drop_pending_updates=True)
+        
+        # រក្សាឱ្យ Bot ដើររហូត
+        while True:
+            await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    asyncio.run(main())
-    
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
+                        
