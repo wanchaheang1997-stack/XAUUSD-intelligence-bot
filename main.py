@@ -4,167 +4,157 @@ import datetime
 import asyncio
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import pytz
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from telegram.error import BadRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# --- កំណត់ការបង្ហាញព័ត៌មានក្នុង Log ---
+# --- SYSTEM LOGGING ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- ទាញយកតម្លៃពី Environment Variables ---
+# --- CONFIG & ENV ---
 BOT_TOKEN   = os.getenv("BOT_TOKEN")
 MY_CHAT_ID  = os.getenv("MY_CHAT_ID")
 TOPIC_ID    = os.getenv("TOPIC_ID")
-ALERT_TOPIC = "3"  # Topic សម្រាប់របាយការណ៍ស្វ័យប្រវត្តិ
+ALERT_TOPIC = "3"
 
-# --- Function វិភាគទីផ្សារ (Advanced ICT & Indicators) ---
-async def get_market_analysis():
-    try:
-        gold = yf.Ticker("GC=F")
-        df = gold.history(period="10d", interval="1h")
-        if df.empty: return None
+# --- CORE ICT LOGIC ENGINE ---
+class ICTAnalyzer:
+    def __init__(self, symbol="GC=F"):
+        self.symbol = symbol
 
-        # តម្លៃបច្ចុប្បន្ន
-        price = round(df["Close"].iloc[-1], 4)
-        high_h1 = round(df["High"].iloc[-1], 4)
-        low_h1 = round(df["Low"].iloc[-1], 4)
+    async def fetch_data(self):
+        try:
+            # ទាញយកទិន្នន័យមាស និង DXY
+            gold = yf.Ticker(self.symbol)
+            dxy = yf.Ticker("DX-Y.NYB")
+            
+            df = gold.history(period="20d", interval="1h")
+            d_df = dxy.history(period="5d", interval="1h")
+            
+            if df.empty or d_df.empty: return None
+            return df, d_df
+        except Exception as e:
+            logger.error(f"Fetch Error: {e}")
+            return None
+
+    def get_market_structure(self, df):
+        # រក BOS/CHOCH តាមរយៈ Swing High/Low
+        recent_high = df['High'].iloc[-50:-1].max()
+        recent_low = df['Low'].iloc[-50:-1].min()
+        last_close = df['Close'].iloc[-1]
         
-        # Support/Resistance (High/Low ក្នុងរយៈពេល ៥ ថ្ងៃ)
-        res = round(df["High"].max(), 2)
-        sup = round(df["Low"].min(), 2)
-        eq_level = round((res + sup) / 2, 2)
+        if last_close > recent_high: return "🐂 BULLISH (BOS Up)"
+        if last_close < recent_low: return "🐻 BEARISH (BOS Down)"
+        return "⚖️ RANGING"
 
-        # គណនា RSI
-        delta = df["Close"].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rsi = round(100 - (100 / (1 + (gain / loss))).iloc[-1], 2)
+    def find_levels(self, df):
+        # គណនា Fair Value Gap (FVG)
+        fvg = "None"
+        for i in range(len(df)-3, len(df)-1):
+            if df['Low'].iloc[i+1] > df['High'].iloc[i-1]: # Bullish FVG
+                fvg = f"{df['High'].iloc[i-1]:.2f} - {df['Low'].iloc[i+1]:.2f}"
+            elif df['High'].iloc[i+1] < df['Low'].iloc[i-1]: # Bearish FVG
+                fvg = f"{df['Low'].iloc[i-1]:.2f} - {df['High'].iloc[i+1]:.2f}"
 
-        # គណនា MACD (Simple)
-        exp1 = df["Close"].ewm(span=12, adjust=False).mean()
-        exp2 = df["Close"].ewm(span=26, adjust=False).mean()
-        macd = round((exp1 - exp2).iloc[-1], 2)
-        signal_line = round((exp1 - exp2).ewm(span=9, adjust=False).mean().iloc[-1], 2)
-
-        # ស្វែងរក FVG (Fair Value Gap) - ឧទាហរណ៍គំរូ
-        # Bull FVG: Low(i) > High(i-2)
-        bull_fvg = f"{round(df['Low'].iloc[-1], 2)} – {round(df['High'].iloc[-3], 2)}"
+        # គណនា Order Block (OB)
+        # ទៀនបញ្ច្រាសចុងក្រោយមុនការផ្ទុះតម្លៃ
+        ob = df['Low'][df['Close'] < df['Open']].iloc[-1]
         
-        return {
-            "price": price, "high": high_h1, "low": low_h1, 
-            "res": res, "sup": sup, "eq": eq_level, 
-            "rsi": rsi, "macd": macd, "signal": signal_line,
-            "fvg": bull_fvg
-        }
-    except Exception as e:
-        logger.error(f"Analysis Error: {e}")
-        return None
+        # Liquidity & Equilibrium
+        bsl = df['High'].iloc[-100:].max()
+        ssl = df['Low'].iloc[-100:].min()
+        eq = (bsl + ssl) / 2
+        
+        return {"fvg": fvg, "ob": ob, "bsl": bsl, "ssl": ssl, "eq": eq}
 
-# --- Function ផ្ញើរបាយការណ៍ ---
-async def send_full_report(context: ContextTypes.DEFAULT_TYPE, is_scheduled=False):
-    data = await get_market_analysis()
+# --- REPORT GENERATOR ---
+async def generate_ict_report(context: ContextTypes.DEFAULT_TYPE, is_scheduled=False):
+    analyzer = ICTAnalyzer()
+    data = await analyzer.fetch_data()
     if not data: return
-
-    # កំណត់ម៉ោងស្រុកខ្មែរ
-    kh_tz = pytz.timezone('Asia/Phnom_Penh')
-    now_kh = datetime.datetime.now(kh_tz)
-    time_str = now_kh.strftime("%Y-%m-%d %H:%M")
     
-    # --- លក្ខខណ្ឌ Monday - Friday (Market Open) ---
-    day_of_week = now_kh.weekday() 
-    if day_of_week < 5:
-        status_market = "🟢 Market Open (Monday - Friday)"
-    else:
-        status_market = "⚠️ Weekend showing last available data (Weekend)"
+    df, dxy_df = data
+    analysis = analyzer.find_levels(df)
+    trend = analyzer.get_market_structure(df)
+    
+    kh_tz = pytz.timezone('Asia/Phnom_Penh')
+    now = datetime.datetime.now(kh_tz)
+    
+    # Session Detection
+    hour = now.hour
+    session = "☕ Asian"
+    if 14 <= hour < 18: session = "💂 London Killzone"
+    elif 19 <= hour < 23: session = "🗽 NY Killzone"
+    
+    # Market Status
+    market_status = "🟢 Market Open" if now.weekday() < 5 else "⚠️ Weekend (Static Data)"
+    
+    # DXY Context
+    dxy_price = dxy_df['Close'].iloc[-1]
+    dxy_bias = "Weak (Bullish for Gold)" if dxy_price < dxy_df['Close'].iloc[-5] else "Strong (Bearish for Gold)"
+
+    # Signal Confluence
+    signal = "⏳ WAIT"
+    last_price = df['Close'].iloc[-1]
+    if "BULLISH" in trend and last_price < analysis['eq'] and dxy_price < dxy_df['Close'].iloc[-2]:
+        signal = "🚀 BUY (Discount + DXY Weak)"
+    elif "BEARISH" in trend and last_price > analysis['eq'] and dxy_price > dxy_df['Close'].iloc[-2]:
+        signal = "📉 SELL (Premium + DXY Strong)"
 
     report = (
+        "🛡️ *CORE SYSTEM MONITORING*\n"
+        "Check Economic Calendar & DXY before entry. Align bias with HTF.\n\n"
         "🏦 *E11 INTELLIGENCE — XAUUSD*\n"
-        f"🕐 {time_str} (Cambodia)\n"
-        f"{status_market}\n\n"
+        f"🕐 {now.strftime('%Y-%m-%d %H:%M')} (KH)\n"
+        f"{market_status} | {session}\n\n"
         "💰 *PRICE*\n"
-        f"  Current : ${data['price']}\n"
-        f"  H1 High : ${data['high']}\n"
-        f"  H1 Low  : ${data['low']}\n\n"
-        "📊 *TREND*\n"
-        "  ⚖️ RANGING\n"
-        "  Mixed EMA signals\n\n"
-        "📐 *SUPPORT & RESISTANCE*\n"
-        f"  🟢 Support    : ${data['sup']}\n"
-        f"  🔴 Resistance : ${data['res']}\n\n"
+        f"  Current : ${last_price:.2f}\n"
+        f"  DXY Index : {dxy_price:.2f} ({dxy_bias})\n\n"
+        "📊 *MARKET STRUCTURE*\n"
+        f"  Trend : {trend}\n"
+        f"  EQ Level : ${analysis['eq']:.2f}\n\n"
         "🧠 *ICT KEY LEVELS*\n"
-        f"  EQ Level    : ${data['eq']}\n"
-        f"  Bull FVG    : {data['fvg']}\n\n"
-        "📈 *INDICATORS*\n"
-        f"  RSI (14)  : {data['rsi']} ✅\n"
-        f"  MACD      : {data['macd']} | Signal: {data['signal']}\n\n"
+        f"  Order Block : ${analysis['ob']:.2f}\n"
+        f"  FVG Zone    : {analysis['fvg']}\n\n"
         "🎯 *SIGNAL*\n"
-        "  ⏳ WAIT\n"
-        "  No clear signal — stay patient\n"
+        f"  Action : {signal}\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        "E11 Sniper Bot • Educational use only"
+        "E11 Sniper Bot • Sonnet 4.6 Adaptive"
     )
 
-    target_topic = ALERT_TOPIC if is_scheduled else TOPIC_ID
-    
-    try:
-        await context.bot.send_message(
-            chat_id=MY_CHAT_ID,
-            text=report,
-            message_thread_id=target_topic,
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Send Error: {e}")
+    target = ALERT_TOPIC if is_scheduled else TOPIC_ID
+    await context.bot.send_message(
+        chat_id=MY_CHAT_ID, 
+        text=report, 
+        message_thread_id=target, 
+        parse_mode="Markdown"
+    )
 
-# --- Bot Commands ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 E11 Sniper Bot Is Online!")
-
-async def manual_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_full_report(context, is_scheduled=False)
-
-# --- Main Logic ---
+# --- MAIN RUNNER ---
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    scheduler = AsyncIOScheduler(timezone=pytz.timezone('Asia/Phnom_Penh'))
+
+    # Schedule: 8AM, 2PM (London), 7PM & 9PM (NY)
+    for hr in [8, 14, 19, 21]:
+        scheduler.add_job(generate_ict_report, 'cron', hour=hr, minute=0, args=[app])
+
+    app.add_handler(CommandHandler("report", lambda u, c: generate_ict_report(c)))
     
-    kh_tz = pytz.timezone('Asia/Phnom_Penh')
-    scheduler = AsyncIOScheduler(timezone=kh_tz)
-
-    # Schedule ផ្ញើរបាយការណ៍ ៣ ដងក្នុងមួយថ្ងៃ
-    for hr in [8, 14, 19]:
-        scheduler.add_job(
-            send_full_report, 
-            'cron', hour=hr, minute=0, 
-            args=[app], name=f"Job_{hr}"
-        )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("report", manual_report))
-
     async with app:
         await app.initialize()
         await app.start()
         scheduler.start()
-        
-        logger.info("✅ Bot running with Timezone: Asia/Phnom_Penh")
+        logger.info("✅ E11 Sniper Bot is Live with ICT Logic")
         await app.updater.start_polling(drop_pending_updates=True)
-        
-        try:
-            while True:
-                await asyncio.sleep(3600)
-        except (KeyboardInterrupt, SystemExit):
-            await app.stop()
-            scheduler.shutdown()
+        while True: await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logger.critical(f"Fatal Error: {e}")
+    asyncio.run(main())
     
