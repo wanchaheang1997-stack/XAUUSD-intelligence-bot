@@ -37,49 +37,51 @@ class E11IntelligenceEngine:
     @staticmethod
     async def get_market_data():
         try:
+            # ប្រើ Ticker ផ្លូវការសម្រាប់ឆ្នាំ 2026
             gold = yf.Ticker("GC=F")
             dxy = yf.Ticker("DX-Y.NYB")
             btc = yf.Ticker("BTC-USD")
             
             df_h1 = gold.history(period="7d", interval="1h")
-            df_d = gold.history(period="5d", interval="1d")
-            dxy_p = dxy.history(period="1d")['Close'].iloc[-1]
-            btc_p = btc.history(period="1d")['Close'].iloc[-1]
+            df_d = gold.history(period="10d", interval="1d")
             
-            if df_h1.empty: return None
+            if df_h1.empty or df_d.empty: return None
 
-            # Volume Profile & RSI
+            # 1. Price Context
+            last_p = round(df_h1['Close'].iloc[-1], 2)
+            gold_h = round(df_h1['High'].iloc[-24:].max(), 2)
+            gold_l = round(df_h1['Low'].iloc[-24:].min(), 2)
+            dxy_p = round(dxy.history(period="1d")['Close'].iloc[-1], 2)
+            btc_p = round(btc.history(period="1d")['Close'].iloc[-1], 2)
+
+            # 2. Volume Profile & RSI
             vah, val, poc = E11IntelligenceEngine.calculate_volume_profile(df_h1)
             rsi = E11IntelligenceEngine.calculate_rsi(df_h1['Close'])
             
-            # Key Levels (Daily/Weekly)
+            # 3. Key Levels
             pdh, pdl = df_d['High'].iloc[-2], df_d['Low'].iloc[-2]
             pwh, pwl = df_d['High'].iloc[-5:].max(), df_d['Low'].iloc[-5:].min()
             
-            # Sessions (Asia 06:00 - 15:00 KH)
+            # Asia Session (06:00 - 15:00 KH)
             asia_df = df_h1.between_time('23:00', '08:00')
-            asia_h = asia_df['High'].max() if not asia_df.empty else 0
-            asia_l = asia_df['Low'].min() if not asia_df.empty else 0
+            asia_h = round(asia_df['High'].max(), 2) if not asia_df.empty else 0
+            asia_l = round(asia_df['Low'].min(), 2) if not asia_df.empty else 0
 
-            # Support & Resistance (Pivot points or swing levels)
-            res = df_h1['High'].iloc[-24:].max()
-            sup = df_h1['Low'].iloc[-24:].min()
+            # Support & Resistance (Daily Swing)
+            sup, res = round(df_h1['Low'].iloc[-48:].min(), 2), round(df_h1['High'].iloc[-48:].max(), 2)
 
-            # Liquidity Pool (Order Blocks)
-            bull_ob = df_h1[df_h1['Close'] < df_h1['Open']]['Low'].iloc[-1]
-            bear_ob = df_h1[df_h1['Close'] > df_h1['Open']]['High'].iloc[-1]
+            # 4. Liquidity Pool (OB)
+            bull_ob = round(df_h1[df_h1['Close'] < df_h1['Open']]['Low'].iloc[-1], 2)
+            bear_ob = round(df_h1[df_h1['Close'] > df_h1['Open']]['High'].iloc[-1], 2)
 
             return {
-                "p": round(df_h1['Close'].iloc[-1], 2),
-                "h": round(df_h1['High'].iloc[-1], 2), "l": round(df_h1['Low'].iloc[-1], 2),
-                "dxy": round(dxy_p, 2), "btc": round(btc_p, 2),
+                "p": last_p, "h": gold_h, "l": gold_l, "dxy": dxy_p, "btc": btc_p,
                 "vah": vah, "val": val, "poc": poc,
                 "pwh": round(pwh, 2), "pwl": round(pwl, 2),
                 "pdh": round(pdh, 2), "pdl": round(pdl, 2),
-                "asia_h": round(asia_h, 2), "asia_l": round(asia_l, 2),
-                "sup": round(sup, 2), "res": round(res, 2),
-                "bull_ob": round(bull_ob, 2), "bear_ob": round(bear_ob, 2),
-                "rsi": rsi
+                "asia_h": asia_h, "asia_l": asia_l,
+                "sup": sup, "res": res,
+                "bull_ob": bull_ob, "bear_ob": bear_ob, "rsi": rsi
             }
         except Exception as e:
             logger.error(f"Error: {e}")
@@ -92,7 +94,6 @@ async def send_full_report(context: ContextTypes.DEFAULT_TYPE):
     kh_tz = pytz.timezone('Asia/Phnom_Penh')
     now = datetime.datetime.now(kh_tz)
     
-    # Session Logic
     h = now.hour
     sessions = []
     if 6 <= h < 15: sessions.append("🇯🇵 Tokyo")
@@ -100,9 +101,9 @@ async def send_full_report(context: ContextTypes.DEFAULT_TYPE):
     if 19 <= h or h < 4: sessions.append("🇺🇸 New York")
     sess_str = ", ".join(sessions) if sessions else "Pre-Market"
 
-    # RSI Signal Logic
-    if data['rsi'] <= 30: sig = "✅ ទិញ (Oversold)"
-    elif data['rsi'] >= 70: sig = "🔽 លក់ (Overbought)"
+    # Signal Logic
+    if data['rsi'] <= 35: sig = "✅ ទិញ (Oversold)"
+    elif data['rsi'] >= 65: sig = "🔽 លក់ (Overbought)"
     else: sig = "⏳ រង់ចាំ (Neutral)"
 
     report = (
@@ -119,13 +120,13 @@ async def send_full_report(context: ContextTypes.DEFAULT_TYPE):
         f"  🎯 POC : ${data['poc']}\n"
         f"  ⬇️ VAL : ${data['val']}\n\n"
         "🔑 *Key Level:*\n"
-        f"  💸 PWH : ${data['pwh']}\n"
-        f"  💸 PWL : ${data['pwl']}\n"
-        f"  💸 PDH : ${data['pdh']}\n"
-        f"  💸 PDL : ${data['pdl']}\n"
-        f"  🇯🇵 Asia H : ${data['asia_h']}\n"
-        f"  🇯🇵 Asia L : ${data['asia_l']}\n"
-        f"  ⚠️ Support : ${data['sup']}\n"
+        f"  💸 PWH        : ${data['pwh']}\n"
+        f"  💸 PWL        : ${data['pwl']}\n"
+        f"  💸 PDH        : ${data['pdh']}\n"
+        f"  💸 PDL        : ${data['pdl']}\n"
+        f"  🇯🇵 Asia H    : ${data['asia_h']}\n"
+        f"  🇯🇵 Asia L    : ${data['asia_l']}\n"
+        f"  ⚠️ Support     : ${data['sup']}\n"
         f"  ⚠️ Resistance : ${data['res']}\n\n"
         "💰 *Liquidity Pool (1H):*\n"
         f"  🐂 Bullish OB : ${data['bull_ob']}\n"
@@ -140,9 +141,13 @@ async def send_full_report(context: ContextTypes.DEFAULT_TYPE):
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     scheduler = AsyncIOScheduler(timezone=pytz.timezone('Asia/Phnom_Penh'))
+    
+    # Schedule: 8AM, 2PM, 7PM, 9PM KH Time
     for hr in [8, 14, 19, 21]:
         scheduler.add_job(send_full_report, 'cron', hour=hr, minute=0, args=[app])
+
     app.add_handler(CommandHandler("report", lambda u, c: send_full_report(c)))
+    
     async with app:
         await app.initialize(); await app.start()
         scheduler.start()
