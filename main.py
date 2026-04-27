@@ -37,47 +37,47 @@ class E11IntelligenceEngine:
     @staticmethod
     async def get_market_data():
         try:
-            # Tickers
             gold = yf.Ticker("GC=F")
             dxy = yf.Ticker("DX-Y.NYB")
             btc = yf.Ticker("BTC-USD")
             
             df_h1 = gold.history(period="7d", interval="1h")
             df_d = gold.history(period="5d", interval="1d")
-            dxy_price = dxy.history(period="1d")['Close'].iloc[-1]
-            btc_price = btc.history(period="1d")['Close'].iloc[-1]
+            dxy_p = dxy.history(period="1d")['Close'].iloc[-1]
+            btc_p = btc.history(period="1d")['Close'].iloc[-1]
             
             if df_h1.empty: return None
 
-            # Volume Profile
+            # Volume Profile & RSI
             vah, val, poc = E11IntelligenceEngine.calculate_volume_profile(df_h1)
-            
-            # RSI
             rsi = E11IntelligenceEngine.calculate_rsi(df_h1['Close'])
             
-            # Liquidity Logic
-            pdh = df_d['High'].iloc[-2] # Previous Day High
-            pdl = df_d['Low'].iloc[-2]  # Previous Day Low
-            pwh = df_d['High'].iloc[-5:].max() # Previous Week High (approx)
-            pwl = df_d['Low'].iloc[-5:].min()
+            # Key Levels (Daily/Weekly)
+            pdh, pdl = df_d['High'].iloc[-2], df_d['Low'].iloc[-2]
+            pwh, pwl = df_d['High'].iloc[-5:].max(), df_d['Low'].iloc[-5:].min()
             
-            # Asia Session (06:00 - 15:00 KH time)
-            asia_df = df_h1.between_time('23:00', '08:00') # UTC to KH adjustment
+            # Sessions (Asia 06:00 - 15:00 KH)
+            asia_df = df_h1.between_time('23:00', '08:00')
             asia_h = asia_df['High'].max() if not asia_df.empty else 0
             asia_l = asia_df['Low'].min() if not asia_df.empty else 0
 
-            # Order Blocks
+            # Support & Resistance (Pivot points or swing levels)
+            res = df_h1['High'].iloc[-24:].max()
+            sup = df_h1['Low'].iloc[-24:].min()
+
+            # Liquidity Pool (Order Blocks)
             bull_ob = df_h1[df_h1['Close'] < df_h1['Open']]['Low'].iloc[-1]
             bear_ob = df_h1[df_h1['Close'] > df_h1['Open']]['High'].iloc[-1]
 
             return {
-                "price": round(df_h1['Close'].iloc[-1], 2),
+                "p": round(df_h1['Close'].iloc[-1], 2),
                 "h": round(df_h1['High'].iloc[-1], 2), "l": round(df_h1['Low'].iloc[-1], 2),
-                "dxy": round(dxy_price, 2), "btc": round(btc_price, 2),
+                "dxy": round(dxy_p, 2), "btc": round(btc_p, 2),
                 "vah": vah, "val": val, "poc": poc,
                 "pwh": round(pwh, 2), "pwl": round(pwl, 2),
                 "pdh": round(pdh, 2), "pdl": round(pdl, 2),
                 "asia_h": round(asia_h, 2), "asia_l": round(asia_l, 2),
+                "sup": round(sup, 2), "res": round(res, 2),
                 "bull_ob": round(bull_ob, 2), "bear_ob": round(bear_ob, 2),
                 "rsi": rsi
             }
@@ -92,7 +92,7 @@ async def send_full_report(context: ContextTypes.DEFAULT_TYPE):
     kh_tz = pytz.timezone('Asia/Phnom_Penh')
     now = datetime.datetime.now(kh_tz)
     
-    # Session Detection
+    # Session Logic
     h = now.hour
     sessions = []
     if 6 <= h < 15: sessions.append("🇯🇵 Tokyo")
@@ -101,35 +101,37 @@ async def send_full_report(context: ContextTypes.DEFAULT_TYPE):
     sess_str = ", ".join(sessions) if sessions else "Pre-Market"
 
     # RSI Signal Logic
-    if data['rsi'] <= 35: signal = "✅ ទិញ (Oversold)"
-    elif data['rsi'] >= 65: signal = "🔽 លក់ (Overbought)"
-    else: signal = "⏳ រង់ចាំ (Neutral)"
+    if data['rsi'] <= 30: sig = "✅ ទិញ (Oversold)"
+    elif data['rsi'] >= 70: sig = "🔽 លក់ (Overbought)"
+    else: sig = "⏳ រង់ចាំ (Neutral)"
 
     report = (
         "🏦 *E11 INTELLIGENCE — XAUUSD*\n"
         f"🕐 {now.strftime('%Y-%m-%d %H:%M')} (KH) | \n"
-        f" Market Open | ({sess_str}) តាម killzone\n\n"
+        f" Market Open | ({sess_str})\n\n"
         "💰 *CURRENT MARKET PRICE:*\n"
-        f"💲 Gold High: ${data['h']}\n"
-        f"💲 Gold Low : ${data['l']}\n"
+        f"⚜️ Gold High: ${data['h']}\n"
+        f"⚜️ Gold Low : ${data['l']}\n"
         f"💲 DXY Index: {data['dxy']}\n"
         f"🪙 BTC : ${data['btc']:,}\n\n"
         "📊 *VOLUME PROFILE (1H)*\n"
         f"  ⬆️ VAH : ${data['vah']}\n"
         f"  🎯 POC : ${data['poc']}\n"
         f"  ⬇️ VAL : ${data['val']}\n\n"
-        "💰 *LIQUIDITY POOLS*\n"
+        "🔑 *Key Level:*\n"
         f"  💸 PWH : ${data['pwh']}\n"
         f"  💸 PWL : ${data['pwl']}\n"
         f"  💸 PDH : ${data['pdh']}\n"
         f"  💸 PDL : ${data['pdl']}\n"
         f"  🇯🇵 Asia H : ${data['asia_h']}\n"
-        f"  🇯🇵 Asia L : ${data['asia_l']}\n\n"
-        "🧠 *ICT KEY LEVELS (1H)*\n"
+        f"  🇯🇵 Asia L : ${data['asia_l']}\n"
+        f"  ⚠️ Support : ${data['sup']}\n"
+        f"  ⚠️ Resistance : ${data['res']}\n\n"
+        "💰 *Liquidity Pool (1H):*\n"
         f"  🐂 Bullish OB : ${data['bull_ob']}\n"
         f"  🐻 Bearish OB : ${data['bear_ob']}\n\n"
         "🎯 *SIGNAL*\n"
-        f"  Action : {signal}\n"
+        f"  Action : {sig}\n"
         "━━━━━━━━━━━━━━━━━━━\n"
         "E11 Sniper Bot • ICT Sniper Logic"
     )
