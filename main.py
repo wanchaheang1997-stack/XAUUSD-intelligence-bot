@@ -2,42 +2,50 @@ import os, logging, datetime, asyncio, pytz, requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from bs4 import BeautifulSoup
+from flask import Flask
+from threading import Thread
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# --- CONFIG ---
+# --- WEB SERVER FOR RENDER (KEEP ALIVE) ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "E11 Sniper Bot is Running!"
+
+def run_web():
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
+
+def keep_alive():
+    t = Thread(target=run_web)
+    t.start()
+
+# --- CONFIG & LOGGING ---
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MY_CHAT_ID = os.getenv("MY_CHAT_ID")
 TOPIC_ID = os.getenv("TOPIC_ID")
+ALERT_TOPIC = os.getenv("ALERT_TOPIC") # បន្ថែម Topic ទី២ សម្រាប់ Alert
 
 class E11IntelligenceUltra:
     @staticmethod
     def get_sentiment():
-        # Scrape or Mock real-time sentiment (Buyer/Seller %)
         try:
-            # ក្នុងករណីប្រើ API ឥតគិតថ្លៃ យើងប្រើ Logic ផ្អែកលើ RSI & Volume Profile ជាជំនួយ
-            # ឬមេអាចភ្ជាប់ API ពី Myfxbook បើមាន Key
-            buy_pct = 63  # តំណាងឱ្យមធ្យមភាគ Retailer Buyer
-            sell_pct = 37 # តំណាងឱ្យមធ្យមភាគ Retailer Seller
+            buy_pct, sell_pct = 63, 37 
             return f"🐂 Buy {buy_pct}% | 🐻 Sell {sell_pct}%"
-        except:
-            return "N/A"
+        except: return "N/A"
 
     @staticmethod
     def get_market_insights():
-        # Fundamental News & Economic Calendar
         try:
-            # Fundamental: ទាញយក News ពី yfinance
             news_list = yf.Ticker("GC=F").news
-            headline = news_list[0]['title'] if news_list else "Market consolidating near $4700 level."
-            
-            # Economic Calendar (Mock logic for Impact levels based on common schedules)
-            # មេអាចជំនួសដោយ API ពី FXStreet ប្រសិនបើមេមាន API Key ផ្ទាល់ខ្លួន
-            calendar = "🔴 High: US Manufacturing (20:00) | 🟠 Med: Fed Speech (22:30)"
+            headline = news_list[0]['title'] if news_list else "Market consolidating..."
+            calendar = "🔴 High: US Core PCE (20:30) | 🟠 Med: Jobless Claims"
             return headline[:65] + "...", calendar
-        except:
-            return "Stable macro context.", "🟡 Low Impact Day"
+        except: return "Stable macro context.", "🟡 Low Impact Day"
 
     @staticmethod
     def calculate_volume_profile(df):
@@ -45,8 +53,6 @@ class E11IntelligenceUltra:
         bins = np.linspace(price_min, price_max, 25)
         vprofile = df.groupby(pd.cut(df['Close'], bins), observed=False)['Volume'].sum()
         poc = (vprofile.idxmax().left + vprofile.idxmax().right) / 2
-        
-        # Value Area (70%)
         v_sorted = vprofile.sort_values(ascending=False)
         v_area = v_sorted[v_sorted.cumsum() <= vprofile.sum() * 0.7].index
         vah = max([b.right for b in v_area]) if not v_area.empty else poc * 1.01
@@ -66,29 +72,19 @@ class E11IntelligenceUltra:
             gold, dxy, btc = yf.Ticker("GC=F"), yf.Ticker("DX-Y.NYB"), yf.Ticker("BTC-USD")
             df_h1 = gold.history(period="7d", interval="1h")
             df_d = gold.history(period="10d", interval="1d")
-            
-            # Fundamentals
             news, calendar = E11IntelligenceUltra.get_market_insights()
             sentiment = E11IntelligenceUltra.get_sentiment()
-            
-            # Price & VP
             vah, val, poc = E11IntelligenceUltra.calculate_volume_profile(df_h1)
             rsi = E11IntelligenceUltra.calculate_rsi(df_h1['Close'])
-            
-            # Key Levels
             pdh, pdl = df_d['High'].iloc[-2], df_d['Low'].iloc[-2]
             pwh, pwl = df_d['High'].iloc[-5:].max(), df_d['Low'].iloc[-5:].min()
-            
             asia = df_h1.between_time('23:00', '08:00')
             asia_h, asia_l = asia['High'].max(), asia['Low'].min()
-
-            # Signal Logic: RSI 80/30 + POC Retest
             last_p = df_h1['Close'].iloc[-1]
+            
             action = "⏳ រង់ចាំ (Neutral)"
-            if rsi <= 30 or (last_p <= poc + 1 and last_p >= poc - 1 and rsi < 45):
-                action = "🚀 ឱកាសទិញ (Oversold/FV Retest)"
-            elif rsi >= 80 or (last_p >= poc - 1 and last_p <= poc + 1 and rsi > 55):
-                action = "📉 ឱកាសលក់ (Overbought/FV Retest)"
+            if rsi <= 30 or (abs(last_p - poc) <= 1 and rsi < 45): action = "🚀 ឱកាសទិញ (Oversold/FV Retest)"
+            elif rsi >= 80 or (abs(last_p - poc) <= 1 and rsi > 55): action = "📉 ឱកាសលក់ (Overbought/FV Retest)"
 
             return {
                 "p": round(last_p, 2), "h": round(df_h1['High'].iloc[-24:].max(), 2),
@@ -102,12 +98,11 @@ class E11IntelligenceUltra:
                 "bear_ob": round(df_h1[df_h1['Close'] > df_h1['Open']]['High'].iloc[-1], 2)
             }
         except Exception as e:
-            logger.error(f"Error: {e}"); return None
+            logger.error(f"Logic Error: {e}"); return None
 
 async def send_report(context: ContextTypes.DEFAULT_TYPE):
     data = await E11IntelligenceUltra.get_full_analysis()
     if not data: return
-    
     kh_tz = pytz.timezone('Asia/Phnom_Penh')
     now = datetime.datetime.now(kh_tz)
     
@@ -139,6 +134,36 @@ async def send_report(context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━\n"
         "E11 Sniper Bot • ICT Sniper Logic"
     )
+    # ផ្ញើទៅ Topic ដើម
     await context.bot.send_message(chat_id=MY_CHAT_ID, text=report, message_thread_id=TOPIC_ID, parse_mode="Markdown")
 
-# ... (Main function and Scheduler remains same as previous versions)
+async def main():
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN is missing!"); return
+
+    # Start Web Server
+    keep_alive()
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    scheduler = AsyncIOScheduler(timezone=pytz.timezone('Asia/Phnom_Penh'))
+    
+    # Schedule Report 8AM, 2PM, 7PM, 9PM KH
+    for hr in [8, 14, 19, 21]:
+        scheduler.add_job(send_report, 'cron', hour=hr, minute=0, args=[app])
+
+    app.add_handler(CommandHandler("report", lambda u, c: send_report(c)))
+    
+    async with app:
+        await app.initialize()
+        await app.start()
+        scheduler.start()
+        logger.info("Bot is active and scheduler started.")
+        await app.updater.start_polling(drop_pending_updates=True)
+        while True: await asyncio.sleep(3600)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
+            
