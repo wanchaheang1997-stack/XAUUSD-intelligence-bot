@@ -7,164 +7,91 @@ from threading import Thread
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# --- 1. WEB SERVER សម្រាប់ RENDER (ការពារកុំឱ្យ BOT ដេក) ---
+# --- WEB SERVER FOR RENDER ---
 app = Flask('')
-
 @app.route('/')
-def home():
-    return "E11 Sniper Bot is Running 24/7!"
+def home(): return "E11 Sniper Bot Active!"
+def run_web(): app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
+def keep_alive(): Thread(target=run_web).start()
 
-def run_web():
-    # Render ផ្តល់ Port ឱ្យយើងតាមរយៈ Environment Variable "PORT"
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = Thread(target=run_web)
-    t.start()
-
-# --- 2. CONFIGURATION ---
+# --- CONFIG ---
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MY_CHAT_ID = os.getenv("MY_CHAT_ID")
 TOPIC_ID = os.getenv("TOPIC_ID")
+ALERT_TOPIC = os.getenv("ALERT_TOPIC") # លេខ 3 ដែលមេដាក់ក្នុង Render
 
 class E11IntelligenceUltra:
     @staticmethod
-    def get_market_context():
+    def get_analysis_data():
         try:
-            # Fundamental: ទាញយក News ពី yfinance (Reuters/CNBC Style)
-            gold_news = yf.Ticker("GC=F").news
-            headline = gold_news[0]['title'] if gold_news else "Focusing on US Economic Data."
-            
-            # Sentiment: មធ្យមភាគពី Retail Sentiment (fxssi/cot logic)
-            sentiment = "🐂 Buy 63% | 🐻 Sell 37%" 
-            
-            # Calendar: បង្ហាញព័ត៌មានតាមម៉ោងចេញផ្សាយ
-            calendar = "🔴 20:30 US Core PCE | 🟠 22:00 Fed Speech"
-            return headline[:75] + "...", sentiment, calendar
-        except:
-            return "Market context stable.", "N/A", "🟡 Low Impact Day"
-
-    @staticmethod
-    def calculate_vp_and_levels(df_h1, df_d):
-        # Volume Profile លើ Daily Candle
-        price_min, price_max = df_d['Low'].iloc[-1], df_d['High'].iloc[-1]
-        bins = np.linspace(price_min, price_max, 25)
-        vprofile = df_h1.groupby(pd.cut(df_h1['Close'], bins), observed=False)['Volume'].sum()
-        poc = (vprofile.idxmax().left + vprofile.idxmax().right) / 2
-        vah = poc * 1.012; val = poc * 0.988 
-        
-        # Session High/Low (តម្រូវតាមម៉ោង Report)
-        now_kh = datetime.datetime.now(pytz.timezone('Asia/Phnom_Penh'))
-        h = now_kh.hour
-        session_data = df_h1.iloc[-8:] # ទិន្នន័យ ៨ ម៉ោងចុងក្រោយ
-        return round(vah, 2), round(val, 2), round(poc, 2), round(session_data['High'].max(), 2), round(session_data['Low'].min(), 2)
-
-    @staticmethod
-    async def get_full_analysis():
-        try:
-            gold, dxy, btc = yf.Ticker("GC=F"), yf.Ticker("DX-Y.NYB"), yf.Ticker("BTC-USD")
-            df_h1 = gold.history(period="7d", interval="1h")
+            gold = yf.Ticker("GC=F")
+            df_h1 = gold.history(period="5d", interval="1h")
             df_d = gold.history(period="10d", interval="1d")
             
-            news, sentiment, calendar = E11IntelligenceUltra.get_market_context()
-            vah, val, poc, sess_h, sess_l = E11IntelligenceUltra.calculate_vp_and_levels(df_h1, df_d)
-            
+            # Volume Profile & Levels
             last_p = df_h1['Close'].iloc[-1]
-            pdh, pdl = df_d['High'].iloc[-2], df_d['Low'].iloc[-2]
             pwh, pwl = df_d['High'].iloc[-5:].max(), df_d['Low'].iloc[-5:].min()
-
-            # --- SIGNAL LOGIC (Premium/Discount 70/30) ---
-            swing_high = df_h1['High'].iloc[-24:].max()
-            swing_low = df_h1['Low'].iloc[-24:].min()
-            range_size = swing_high - swing_low
-            premium_zone = swing_low + (range_size * 0.7)
-            discount_zone = swing_low + (range_size * 0.3)
             
-            action = "⏳ រង់ចាំ (Neutral)"
-            if last_p < discount_zone:
-                action = "🚀 BUY (In Discount Zone)"
-            elif last_p > premium_zone:
-                action = "📉 SELL (In Premium Zone)"
-
+            # Premium/Discount Logic
+            swing_h, swing_l = df_h1['High'].iloc[-24:].max(), df_h1['Low'].iloc[-24:].min()
+            range_s = swing_h - swing_l
+            premium, discount = swing_l + (range_s * 0.7), swing_l + (range_s * 0.3)
+            
             return {
-                "p": round(last_p, 2), "h": round(df_d['High'].iloc[-1], 2), "l": round(df_d['Low'].iloc[-1], 2),
-                "dxy": round(dxy.history(period="1d")['Close'].iloc[-1], 2),
-                "btc": round(btc.history(period="1d")['Close'].iloc[-1], 2),
-                "vah": vah, "val": val, "poc": poc, "pwh": round(pwh, 2), "pwl": round(pwl, 2),
-                "pdh": round(pdh, 2), "pdl": round(pdl, 2), "sess_h": sess_h, "sess_l": sess_l,
-                "news": news, "calendar": calendar, "sentiment": sentiment, "action": action,
-                "bull_ob": round(swing_low + 3, 2), "bear_ob": round(swing_high - 3, 2)
+                "p": round(last_p, 2), "pwh": round(pwh, 2), "pwl": round(pwl, 2),
+                "premium": premium, "discount": discount, "df_h1": df_h1, "df_d": df_d
             }
         except Exception as e:
-            logger.error(f"Analysis Error: {e}"); return None
+            logger.error(f"Data Fetch Error: {e}"); return None
 
-async def send_report(context: ContextTypes.DEFAULT_TYPE):
-    data = await E11IntelligenceUltra.get_full_analysis()
+# --- FUNCTION សម្រាប់ ALERT ភ្លាមៗ (បាញ់ចូល Topic 3) ---
+async def price_monitor(context: ContextTypes.DEFAULT_TYPE):
+    data = await E11IntelligenceUltra.get_analysis_data()
     if not data: return
-    kh_tz = pytz.timezone('Asia/Phnom_Penh')
-    now = datetime.datetime.now(kh_tz)
     
-    h = now.hour
-    sess_name = "🇯🇵 Tokyo" if 6 <= h < 14 else "🇬🇧 London" if 14 <= h < 19 else "🇺🇸 New York"
+    last_p = data['p']
+    target_topic = ALERT_TOPIC if ALERT_TOPIC else TOPIC_ID
 
-    report = (
-        "🏦 *E11 INTELLIGENCE — XAUUSD*\n"
-        f"🕐 {now.strftime('%Y-%m-%d %H:%M')} (KH) | 🟢 Open\n"
-        f"🧬 Fundamental: {data['news']}\n"
-        f"🧬 Sentimental: {data['sentiment']}\n"
-        f"⚠️ Economic Calendar: {data['calendar']}\n\n"
-        "💰 *CURRENT MARKET PRICE:*\n"
-        f"⚜️ Gold High: ${data['h']}\n"
-        f"⚜️ Gold Low : ${data['l']}\n"
-        f"💲 DXY Index: {data['dxy']}\n"
-        f"🪙 BTC : ${data['btc']:,}\n\n"
-        "📊 *VOLUME PROFILE (Daily)*\n"
-        f"  ⬆️ VAH : ${data['vah']}\n"
-        f"  🎯 POC : ${data['poc']}\n"
-        f"  ⬇️ VAL : ${data['val']}\n\n"
-        "🔑 *Key Level:*\n"
-        f"  💸 PWH: ${data['pwh']} | PWL: ${data['pwl']}\n"
-        f"  💸 PDH: ${data['pdh']} | PDL: ${data['pdl']}\n"
-        f"  {sess_name} H: ${data['sess_h']} | {sess_name} L: ${data['sess_l']}\n"
-        f"  ⚠️ Support: ${data['pwl']} | Resistance: ${data['pwh']}\n\n"
-        "💰 *Liquidity Pool (1H):*\n"
-        f"  🐂 Bullish OB : ${data['bull_ob']}\n"
-        f"  🐻 Bearish OB : ${data['bear_ob']}\n\n"
-        "🎯 *SIGNAL*\n"
-        f"  Action : {data['action']}\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        "E11 Sniper Bot • ICT Sniper Logic"
-    )
+    # Alert ពេលបុក Resistance ឬចូលតំបន់លក់
+    if last_p >= data['pwh']:
+        msg = f"🔴 *SNIPER ALERT: SELL ZONE*\n\n⚜️ Price: ${last_p}\n🎯 Level: Resistance (PWH)\n⚡️ Status: Extreme Premium\n\n*E11 Sniper Logic*"
+        await context.bot.send_message(chat_id=MY_CHAT_ID, text=msg, message_thread_id=target_topic, parse_mode="Markdown")
+    
+    # Alert ពេលបុក Support ឬចូលតំបន់ទិញ
+    elif last_p <= data['pwl']:
+        msg = f"🟢 *SNIPER ALERT: BUY ZONE*\n\n⚜️ Price: ${last_p}\n🎯 Level: Support (PWL)\n⚡️ Status: Extreme Discount\n\n*E11 Sniper Logic*"
+        await context.bot.send_message(chat_id=MY_CHAT_ID, text=msg, message_thread_id=target_topic, parse_mode="Markdown")
+
+# --- FUNCTION សម្រាប់ REPORT តាមម៉ោង (បាញ់ចូល Topic ដើម) ---
+async def send_report(context: ContextTypes.DEFAULT_TYPE):
+    # (មេអាចប្រើកូដ Report ចាស់ដែលបងធ្លាប់ឱ្យពីមុនបាន ឬប្រើទម្រង់សង្ខេបនេះ)
+    data = await E11IntelligenceUltra.get_analysis_data()
+    if not data: return
+    report = f"🏦 *E11 DAILY REPORT*\n💰 Price: ${data['p']}\n📊 Range: ${data['pwl']} - ${data['pwh']}\n━━━━━━━━━━━━━━━━━━━"
     await context.bot.send_message(chat_id=MY_CHAT_ID, text=report, message_thread_id=TOPIC_ID, parse_mode="Markdown")
 
 async def main():
-    # ១. បើក Web Server ឱ្យ Render ឆែក (Keep-alive)
     keep_alive()
-
-    # ២. បង្កើត Telegram Application
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     scheduler = AsyncIOScheduler(timezone=pytz.timezone('Asia/Phnom_Penh'))
     
-    # ៣. កំណត់ម៉ោង Report
+    # កំណត់ម៉ោង Report (Topic 1)
     for hr in [8, 14, 19, 21]:
         scheduler.add_job(send_report, 'cron', hour=hr, minute=0, args=[app])
 
-    app.add_handler(CommandHandler("report", lambda u, c: send_report(c)))
-    
+    # កំណត់ឱ្យ Monitor តម្លៃរៀងរាល់ ១ នាទី (Topic 3)
+    scheduler.add_job(price_monitor, 'interval', minutes=1, args=[app])
+
     async with app:
         await app.initialize(); await app.start()
         scheduler.start()
-        logger.info("Bot is active and scheduler started.")
+        logger.info("E11 Sniper Bot is Online!")
         await app.updater.start_polling(drop_pending_updates=True)
         while True: await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
-            
+    asyncio.run(main())
+    
