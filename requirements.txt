@@ -1,6 +1,9 @@
 python-telegram-bot
-pandas
 yfinance
-apscheduler
+pandas
 numpy
 pytz
+apscheduler
+beautifulsoup4
+requests
+flask
