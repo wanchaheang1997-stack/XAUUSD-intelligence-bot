@@ -1,6 +1,7 @@
-import os, asyncio, pytz, datetime, logging
+import os, asyncio, pytz, datetime
 from polygon import RESTClient
 import pandas as pd
+import pandas_ta as ta
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -18,71 +19,77 @@ client = RESTClient(POLYGON_KEY)
 # --- WEB SERVER ---
 app_web = Flask('')
 @app_web.route('/')
-def home(): return "E11 Polygon Bot Active!"
+def home(): return "E11 Intelligence Engine Active!"
 def run(): app_web.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
 
-# --- POLYGON DATA ENGINE ---
-def get_analysis():
+def get_smart_analysis():
     try:
-        # ១. ទាញទិន្នន័យមាស (XAUUSD) ពី Polygon
+        # STEP 1: DATA GATHERING
         now = datetime.datetime.now(pytz.utc)
-        start = (now - datetime.timedelta(days=3)).strftime('%Y-%m-%d')
+        start = (now - datetime.timedelta(days=10)).strftime('%Y-%m-%d')
         end = now.strftime('%Y-%m-%d')
         
-        # ទាញយកតារាងតម្លៃកម្រិត 15 នាទី ដើម្បីឱ្យ Session ហ្មត់ចត់
-        aggs = client.get_aggs("C:XAUUSD", 15, "minute", start, end)
+        aggs = client.get_aggs("C:XAUUSD", 1, "hour", start, end)
         df = pd.DataFrame(aggs)
-        
-        # ប្តូរ Timezone ទៅម៉ោងខ្មែរ
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_convert('Asia/Phnom_Penh')
-        df.set_index('timestamp', inplace=True)
-
-        # ២. គណនា Session High/Low (NY: 19:00 - 02:00 KH)
-        ny_session = df.between_time('19:00', '02:00')
-        ny_h = round(ny_session['high'].max(), 2) if not ny_session.empty else 0
-        ny_l = round(ny_session['low'].min(), 2) if not ny_session.empty else 0
         
-        # ៣. ព័ត៌មានបច្ចុប្បន្ន
+        # STEP 2: BIAS DETERMINATION (Indicator Logic)
+        df['ema200'] = ta.ema(df['close'], length=200)
+        df['rsi'] = ta.rsi(df['close'], length=14)
+        
         last_p = round(df['close'].iloc[-1], 2)
-        h24 = round(df['high'].iloc[-96:].max(), 2)
-        l24 = round(df['low'].iloc[-96:].min(), 2)
+        ema200 = round(df['ema200'].iloc[-1], 2)
+        rsi = round(df['rsi'].iloc[-1], 2)
         
-        # Volume Profile (Simulated)
-        poc = round((h24 + l24) / 2, 2)
-        vah, val = round(h24 - 2, 2), round(l24 + 2, 2)
-        
-        # Logic Signal
-        action = "🚀 BUY (In Discount Zone)" if last_p < poc else "⚡️ SELL (In Premium Zone)"
+        # Determine Bias
+        if last_p > ema200:
+            bias = "Bullish 📈"
+            context = "តម្លៃនៅលើ EMA 200 (D1/H4) - ទីផ្សារមានកម្លាំងទិញខ្លាំង"
+        else:
+            bias = "Bearish 📉"
+            context = "តម្លៃនៅក្រោម EMA 200 - ទីផ្សារស្ថិតក្នុងសម្ពាធលក់"
+
+        # STEP 3: SCENARIO GENERATION
+        if rsi > 70:
+            scenario = "⚠️ OVERBOUGHT: រង់ចាំការទម្លាក់ថ្លៃ (Correction) មុននឹងរកឱកាសចូល"
+            action = "⚡️ SELL (Scalp) ឬ Wait for Retest"
+        elif rsi < 30:
+            scenario = "⚠️ OVERSOLD: តម្លៃទាបខ្លាំង រកឱកាសងើបឡើងវិញ (Rebound)"
+            action = "🚀 BUY (Discount Zone)"
+        else:
+            scenario = "⚖️ NEUTRAL: តម្លៃកំពុងរក្សាលំនឹងក្នុងតំបន់ Equilibrium"
+            action = "🔍 រង់ចាំបំបែក PDH ឬ PDL"
+
         now_kh = datetime.datetime.now(pytz.timezone('Asia/Phnom_Penh')).strftime('%Y-%m-%d %H:%M')
 
-        return (
+        # CONTEXTUAL MESSAGE STRUCTURE
+        msg = (
             f"🏦 *E11 INTELLIGENCE — XAUUSD*\n"
-            f"🕐 {now_kh} (KH) | 🟢 Real-time (Polygon)\n"
-            f"🧬 Fundamental: Market context stable.\n\n"
-            f"💰 *CURRENT MARKET PRICE:*\n"
-            f"⚜️ Gold High: `${h24}`\n"
-            f"⚜️ Gold Low : `${l24}`\n\n"
-            f"📊 *VOLUME PROFILE*\n"
-            f"  🎯 POC : `${poc}`\n"
-            f"  ⬆️ VAH : `${vah}` | ⬇️ VAL : `${val}`\n\n"
-            f"🔑 *Key Level:*\n"
-            f"  🇺🇸 New York H: `${ny_h}`\n"
-            f"  🇺🇸 New York L: `${ny_l}`\n"
-            f"  ⚠️ Support: `${l24}` | Resistance: `${h24}`\n\n"
-            f"🎯 *SIGNAL*\n"
-            f"  Action : {action}\n"
+            f"🕐 {now_kh} (KH) | 🟢 Live Feed\n\n"
+            f"📊 *MARKET SNAPSHOT*\n"
+            f"💰 Price: `${last_p}`\n"
+            f"⚡️ RSI (14): `{rsi}`\n"
+            f"🌊 EMA 200: `${ema200}`\n\n"
+            f"🧬 *FUNDAMENTAL & BIAS*\n"
+            f"📉 Trend Bias: *{bias}*\n"
+            f"📝 Context: {context}\n"
+            f"⚠️ News: 🟡 Low Impact Day\n\n"
+            f"🎯 *ACTION PLAN (SCENARIO)*\n"
+            f"🎭 Scenario: {scenario}\n"
+            f"🏁 Action: *{action}*\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
-            f"E11 Sniper Bot • Polygon API"
+            f"E11 Sniper Bot • AI Logic Engine"
         )
+        return msg
     except Exception as e:
-        return f"❌ Polygon Error: {str(e)}"
+        return f"❌ Error: {str(e)}"
 
-# --- BOT HANDLERS ---
+# --- TELEGRAM BOT SETUP ---
 async def manual_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(get_analysis(), parse_mode="Markdown")
+    await update.message.reply_text(get_smart_analysis(), parse_mode="Markdown")
 
 async def auto_report(context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=MY_CHAT_ID, text=get_analysis(), message_thread_id=TOPIC_ID, parse_mode="Markdown")
+    await context.bot.send_message(chat_id=MY_CHAT_ID, text=get_smart_analysis(), message_thread_id=TOPIC_ID, parse_mode="Markdown")
 
 async def main():
     Thread(target=run).start()
